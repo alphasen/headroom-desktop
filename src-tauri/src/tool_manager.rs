@@ -1496,6 +1496,12 @@ impl ToolManager {
             }
         })?;
 
+        // Ad-hoc sign every native extension pip just dropped into the venv.
+        // PyPI wheels are unsigned; some EDR tooling stalls or blocks on
+        // first-execution of unsigned binaries. Best-effort — failures are
+        // logged and ignored, the smoke test downstream is the real gate.
+        self.ad_hoc_sign_venv_natives();
+
         progress(BootstrapStepUpdate {
             step: "Configuring integrations",
             message: "Setting up Headroom MCP integration.".into(),
@@ -1641,6 +1647,70 @@ impl ToolManager {
             .context("Headroom smoke test failed — the new version cannot be imported");
         }
         Ok(())
+    }
+
+    /// Apply an ad-hoc codesign signature to every native extension (.so /
+    /// .dylib) under the venv's site-packages. PyPI wheels arrive unsigned,
+    /// and some endpoint protection (EDR) tooling either blocks unsigned
+    /// freshly-extracted binaries outright or makes them slower to load on
+    /// first execution. An ad-hoc signature (`codesign --force --sign -`)
+    /// satisfies macOS Gatekeeper's "signed" check and clears at least one
+    /// class of EDR heuristic without us shipping a Developer ID at runtime.
+    ///
+    /// Best-effort: failures are logged and ignored. The install must not
+    /// fail because codesign couldn't sign one file — the smoke test that
+    /// follows is the real gate.
+    fn ad_hoc_sign_venv_natives(&self) -> usize {
+        if !cfg!(target_os = "macos") {
+            return 0;
+        }
+        let site_packages = self
+            .runtime
+            .venv_dir
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        if !site_packages.exists() {
+            return 0;
+        }
+        let mut native_paths: Vec<PathBuf> = Vec::new();
+        if let Err(err) = collect_native_extensions(&site_packages, &mut native_paths) {
+            log::warn!(
+                "ad-hoc codesign skipped: failed to walk {}: {err:#}",
+                site_packages.display()
+            );
+            return 0;
+        }
+        if native_paths.is_empty() {
+            return 0;
+        }
+        let total = native_paths.len();
+        // One codesign invocation can accept many file arguments; ARG_MAX
+        // (~256KB on macOS) is well above what we'd hit even with 1000+
+        // long paths, so we avoid the per-file fork-exec overhead.
+        let output = Command::new("codesign")
+            .args(["--force", "--sign", "-"])
+            .args(&native_paths)
+            .output();
+        match output {
+            Ok(out) if out.status.success() => {
+                log::info!("ad-hoc codesign signed {total} venv native extensions");
+                total
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                log::warn!(
+                    "ad-hoc codesign exited {:?} for {total} files: {}",
+                    out.status.code(),
+                    stderr.trim()
+                );
+                0
+            }
+            Err(err) => {
+                log::warn!("ad-hoc codesign failed to spawn: {err:#}");
+                0
+            }
+        }
     }
 
     fn venv_backup_dir(&self) -> PathBuf {
@@ -2284,6 +2354,10 @@ impl ToolManager {
                 error: err.context(context_msg),
             };
         }
+
+        // Ad-hoc sign every native extension pip just dropped in. Failures
+        // are logged and ignored; the smoke test below is the real gate.
+        self.ad_hoc_sign_venv_natives();
 
         progress(BootstrapStepUpdate {
             step: "Verifying install",
@@ -3843,6 +3917,29 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Recursively collect every `.so` / `.dylib` under `dir`. Used by
+/// `ad_hoc_sign_venv_natives` to enumerate the native extensions pip
+/// dropped into the venv. Symlinks are followed via `read_dir`'s default
+/// behavior on macOS, but `file_type` is checked so we don't recurse into
+/// non-directories. Errors propagate so the caller can log + skip.
+fn collect_native_extensions(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("read_dir {}", dir.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_native_extensions(&path, out)?;
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if ext == "so" || ext == "dylib" {
+                out.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Hash a requirements lock file ignoring comments and blank lines, so that
 /// header/comment churn does not force a full `pip install` on upgrade.
 fn requirements_lock_sha(lock: &str) -> String {
@@ -5253,6 +5350,57 @@ after
     fn commit_headroom_upgrade_is_noop_without_backup() {
         let (root, _runtime, manager) = seed_test_runtime("commit-noop");
         manager.commit_headroom_upgrade().expect("noop ok");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collect_native_extensions_walks_recursively_and_filters_by_extension() {
+        let root = unique_temp_dir("collect-natives");
+        let sp = root.join("site-packages");
+        let pkg = sp.join("torch").join("_C");
+        fs::create_dir_all(&pkg).expect("nested dirs");
+        // Should be collected:
+        fs::write(sp.join("mmh3.cpython-312-darwin.so"), b"").expect("so file");
+        fs::write(pkg.join("libtorch_python.dylib"), b"").expect("dylib file");
+        fs::write(
+            sp.join("hnswlib").join("hnswlib.cpython-312-darwin.so"),
+            b"",
+        )
+        .or_else(|_| {
+            fs::create_dir_all(sp.join("hnswlib")).and_then(|_| {
+                fs::write(
+                    sp.join("hnswlib").join("hnswlib.cpython-312-darwin.so"),
+                    b"",
+                )
+            })
+        })
+        .expect("nested so");
+        // Should NOT be collected:
+        fs::write(sp.join("README.md"), b"docs").expect("md file");
+        fs::write(sp.join("module.py"), b"code").expect("py file");
+        fs::write(pkg.join("_C.pyi"), b"stubs").expect("pyi file");
+
+        let mut paths = Vec::new();
+        super::collect_native_extensions(&sp, &mut paths).expect("walk ok");
+        paths.sort();
+
+        assert_eq!(paths.len(), 3, "expected 3 native files, got {paths:?}");
+        assert!(paths.iter().any(|p| p.ends_with("mmh3.cpython-312-darwin.so")));
+        assert!(paths.iter().any(|p| p.ends_with("libtorch_python.dylib")));
+        assert!(paths
+            .iter()
+            .any(|p| p.ends_with("hnswlib.cpython-312-darwin.so")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ad_hoc_sign_venv_natives_returns_zero_when_site_packages_missing() {
+        // Fresh venv dir with no lib/python3.12/site-packages subtree — the
+        // helper must silently return 0 rather than error. This is the path
+        // exercised on every install before pip has populated the venv.
+        let (root, _runtime, manager) = seed_test_runtime("codesign-no-sitepackages");
+        assert_eq!(manager.ad_hoc_sign_venv_natives(), 0);
         let _ = fs::remove_dir_all(root);
     }
 
