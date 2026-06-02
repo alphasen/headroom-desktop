@@ -145,6 +145,7 @@ import type {
   DashboardState,
   HeadroomLearnPrereqStatus,
   HeadroomLearnStatus,
+  HeadroomSubscriptionTier,
   ActivityFeedResponse,
   AppliedPatterns,
   HourlySavingsPoint,
@@ -704,6 +705,13 @@ export default function App() {
   const [uninstallError, setUninstallError] = useState<string | null>(null);
   const [upgradeActionBusy, setUpgradeActionBusy] = useState<UpgradePlanId | null>(null);
   const [upgradeActionError, setUpgradeActionError] = useState<string | null>(null);
+  const [pendingPlanChange, setPendingPlanChange] = useState<{
+    fromTier: HeadroomSubscriptionTier;
+    toTier: HeadroomSubscriptionTier;
+    billingPeriod: BillingPeriod;
+  } | null>(null);
+  const [planChangeBusy, setPlanChangeBusy] = useState(false);
+  const [planChangeError, setPlanChangeError] = useState<string | null>(null);
   const [contactEmail, setContactEmail] = useState("");
   const [contactSubmitBusy, setContactSubmitBusy] = useState(false);
   const [contactSubmitError, setContactSubmitError] = useState<string | null>(null);
@@ -2426,12 +2434,12 @@ export default function App() {
         case "max5x":
         case "max20x": {
           if (activeHeadroomPlanId === planId) return { kind: "internal" as const };
-          // Existing subscriber switching to a different paid tier: route to
-          // the Polar customer portal so the user confirms the plan change in
-          // Polar's UI (preserves any active discount, shows the prorated
-          // upcoming charge). A fresh checkout is rejected by Polar with
-          // "You already have an active subscription".
-          if (activeHeadroomPlanId) return { kind: "billing_portal" as const };
+          // Existing subscriber switching to a different paid tier: show an
+          // in-app confirmation modal, then call our server which PATCHes the
+          // Polar subscription (attempting to preserve the launch discount).
+          // A fresh checkout is rejected by Polar with "You already have an
+          // active subscription", so we cannot reuse the checkout path here.
+          if (activeHeadroomPlanId) return { kind: "change_plan" as const };
           return { kind: "checkout" as const };
         }
         case "team":
@@ -2472,6 +2480,18 @@ export default function App() {
       return;
     }
 
+    if (action.kind === "change_plan") {
+      const fromTier = pricingStatus?.account?.subscriptionTier;
+      if (!fromTier) return;
+      setPlanChangeError(null);
+      setPendingPlanChange({
+        fromTier,
+        toTier: planId as HeadroomSubscriptionTier,
+        billingPeriod
+      });
+      return;
+    }
+
     if (action.kind === "checkout") {
       setUpgradeActionBusy(planId);
       setUpgradeActionError(null);
@@ -2501,7 +2521,11 @@ export default function App() {
       setUpgradeActionError(null);
 
       try {
-        const url = await invoke<string>("get_headroom_billing_portal_url");
+        // Deep-link to the user's subscription page so they land one click
+        // away from "Change plan" instead of at the portal root.
+        const url = await invoke<string>("get_headroom_billing_portal_url", {
+          target: "subscription"
+        });
         await openExternalLink(url);
       } catch (error) {
         setUpgradeActionError(
@@ -2530,6 +2554,37 @@ export default function App() {
     } finally {
       setUpgradeActionBusy(null);
     }
+  }
+
+  async function confirmPlanChange() {
+    if (!pendingPlanChange) return;
+    setPlanChangeBusy(true);
+    setPlanChangeError(null);
+    try {
+      await invoke("change_headroom_subscription_plan", {
+        subscriptionTier: pendingPlanChange.toTier,
+        billingPeriod: pendingPlanChange.billingPeriod
+      });
+      await refreshPricingStatus();
+      setPendingPlanChange(null);
+      setActiveView("home");
+    } catch (error) {
+      setPlanChangeError(
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : "Could not change subscription plan."
+      );
+    } finally {
+      setPlanChangeBusy(false);
+    }
+  }
+
+  function cancelPlanChange() {
+    if (planChangeBusy) return;
+    setPendingPlanChange(null);
+    setPlanChangeError(null);
   }
 
   async function handleContactSubmit(event: FormEvent<HTMLFormElement>) {
@@ -4836,6 +4891,60 @@ export default function App() {
                     type="button"
                   >
                     {uninstallBusy ? "Uninstalling…" : "Uninstall and quit"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {pendingPlanChange ? (
+            <div
+              className="modal-backdrop"
+              role="dialog"
+              aria-modal="true"
+              onClick={cancelPlanChange}
+            >
+              <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+                <h3>Confirm your upgrade</h3>
+                <p>
+                  You'll upgrade from your{" "}
+                  <strong>{upgradePlanIntentLabel(pendingPlanChange.fromTier)}</strong>{" "}
+                  plan to <strong>{upgradePlanIntentLabel(pendingPlanChange.toTier)}</strong>.
+                </p>
+                <p>
+                  You'll be charged a prorated amount today for the remaining time in
+                  your current billing period.
+                </p>
+                {pricingStatus?.account?.subscriptionRenewsAt ? (
+                  <p>
+                    Your subscription will then continue renewing on{" "}
+                    <strong>
+                      {new Date(pricingStatus.account.subscriptionRenewsAt).toLocaleDateString(
+                        undefined,
+                        { year: "numeric", month: "long", day: "numeric" }
+                      )}
+                    </strong>.
+                  </p>
+                ) : null}
+                {planChangeError ? (
+                  <p className="install-progress__error">{planChangeError}</p>
+                ) : null}
+                <div className="modal-actions">
+                  <button
+                    className="secondary-button"
+                    disabled={planChangeBusy}
+                    onClick={cancelPlanChange}
+                    type="button"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    className="primary-button"
+                    disabled={planChangeBusy}
+                    onClick={() => void confirmPlanChange()}
+                    type="button"
+                  >
+                    {planChangeBusy ? "Upgrading…" : "Confirm upgrade"}
                   </button>
                 </div>
               </div>

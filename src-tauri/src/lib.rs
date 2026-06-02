@@ -1677,8 +1677,25 @@ fn create_headroom_checkout_session(
 }
 
 #[tauri::command]
-fn get_headroom_billing_portal_url() -> Result<String, String> {
-    pricing::get_billing_portal_url()
+fn change_headroom_subscription_plan(
+    app: AppHandle,
+    subscription_tier: HeadroomSubscriptionTier,
+    billing_period: BillingPeriod,
+) -> Result<(), String> {
+    pricing::change_subscription_plan(subscription_tier.clone(), billing_period)?;
+    analytics::track_event(
+        &app,
+        "subscription_plan_changed",
+        Some(json!({
+            "subscription_tier": subscription_tier_label(&subscription_tier)
+        })),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+fn get_headroom_billing_portal_url(target: Option<String>) -> Result<String, String> {
+    pricing::get_billing_portal_url(target)
 }
 
 #[tauri::command]
@@ -2691,6 +2708,7 @@ pub fn run() {
             sign_out_headroom_account,
             activate_headroom_account,
             create_headroom_checkout_session,
+            change_headroom_subscription_plan,
             get_headroom_billing_portal_url,
             get_activity_feed,
             list_live_learnings,

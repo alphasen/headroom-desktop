@@ -686,17 +686,68 @@ pub(crate) fn create_checkout_session_with_base_url(
         .map_err(|err| format!("Could not parse checkout response: {err}"))
 }
 
-pub fn get_billing_portal_url() -> Result<String, String> {
-    get_billing_portal_url_with_base_url(&api_base_url())
+pub fn change_subscription_plan(
+    subscription_tier: HeadroomSubscriptionTier,
+    billing_period: BillingPeriod,
+) -> Result<(), String> {
+    change_subscription_plan_with_base_url(subscription_tier, billing_period, &api_base_url())
+}
+
+/// Test-only seam: `change_subscription_plan` against a parameterized base URL.
+pub(crate) fn change_subscription_plan_with_base_url(
+    subscription_tier: HeadroomSubscriptionTier,
+    billing_period: BillingPeriod,
+    base_url: &str,
+) -> Result<(), String> {
+    let token = read_session_token()?
+        .ok_or_else(|| "Sign in to Headroom before changing your plan.".to_string())?;
+    let response = http_client()?
+        .post(join_url(base_url, "desktop/subscriptions/change_plan"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&CheckoutSessionPayload {
+            subscription_tier,
+            billing_period,
+        })
+        .send()
+        .map_err(|err| format!("Could not change subscription plan: {err}"))?;
+
+    if response.status().as_u16() == 401 {
+        clear_session_token()?;
+        return Err("Your Headroom session expired. Sign in again.".into());
+    }
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let api_error = response
+            .json::<ApiErrorResponse>()
+            .ok()
+            .and_then(|body| body.error)
+            .filter(|value| !value.trim().is_empty());
+        return Err(api_error
+            .unwrap_or_else(|| format!("Could not change subscription plan (status {status}).")));
+    }
+
+    Ok(())
+}
+
+pub fn get_billing_portal_url(target: Option<String>) -> Result<String, String> {
+    get_billing_portal_url_with_base_url(&api_base_url(), target.as_deref())
 }
 
 /// Test-only seam: `get_billing_portal_url` against a parameterized base URL.
-pub(crate) fn get_billing_portal_url_with_base_url(base_url: &str) -> Result<String, String> {
+pub(crate) fn get_billing_portal_url_with_base_url(
+    base_url: &str,
+    target: Option<&str>,
+) -> Result<String, String> {
     let token = read_session_token()?
         .ok_or_else(|| "Sign in to Headroom before accessing billing.".to_string())?;
-    let response = http_client()?
+    let mut request = http_client()?
         .get(join_url(base_url, "desktop/billing_portal"))
-        .header("Authorization", format!("Bearer {token}"))
+        .header("Authorization", format!("Bearer {token}"));
+    if let Some(target_value) = target {
+        request = request.query(&[("target", target_value)]);
+    }
+    let response = request
         .send()
         .map_err(|err| format!("Could not reach billing portal: {err}"))?;
 
@@ -3339,9 +3390,11 @@ mod tests {
             "HTTP/1.1 200 OK",
         );
 
-        let url =
-            super::get_billing_portal_url_with_base_url(&format!("http://127.0.0.1:{port}"))
-                .expect("billing portal succeeds");
+        let url = super::get_billing_portal_url_with_base_url(
+            &format!("http://127.0.0.1:{port}"),
+            None,
+        )
+        .expect("billing portal succeeds");
         server.join().unwrap();
 
         assert_eq!(url, "https://billing.polar.sh/customer/abc");
@@ -3356,9 +3409,11 @@ mod tests {
             "HTTP/1.1 404 Not Found",
         );
 
-        let err =
-            super::get_billing_portal_url_with_base_url(&format!("http://127.0.0.1:{port}"))
-                .expect_err("404 surfaces as error");
+        let err = super::get_billing_portal_url_with_base_url(
+            &format!("http://127.0.0.1:{port}"),
+            None,
+        )
+        .expect_err("404 surfaces as error");
         server.join().unwrap();
 
         assert_eq!(err, "Customer not found");
