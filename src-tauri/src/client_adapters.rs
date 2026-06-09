@@ -39,10 +39,16 @@ struct ManagedClientSpec {
     name: &'static str,
 }
 
-const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 1] = [ManagedClientSpec {
-    id: "claude_code",
-    name: "Claude Code",
-}];
+const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 2] = [
+    ManagedClientSpec {
+        id: "claude_code",
+        name: "Claude Code",
+    },
+    ManagedClientSpec {
+        id: "codex",
+        name: "Codex",
+    },
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShellFamily {
@@ -54,10 +60,10 @@ enum ShellFamily {
 pub fn detect_clients() -> Vec<ClientStatus> {
     let setup_state = load_setup_state();
 
-    vec![detect_claude_code_client(is_configured(
-        &setup_state,
-        "claude_code",
-    ))]
+    vec![
+        detect_claude_code_client(is_configured(&setup_state, "claude_code")),
+        detect_codex_client(is_configured(&setup_state, "codex")),
+    ]
 }
 
 pub fn ensure_rtk_integrations(
@@ -136,10 +142,18 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
             changed_files.extend(updates.0);
             backup_files.extend(updates.1);
         }
-        "codex" | "codex_cli" | "codex_gui" => {
-            return Err(anyhow!(
-                "Codex integration has been disabled. Headroom now focuses on Claude Code."
-            ))
+        "codex" | "codex_cli" => {
+            let shell_targets = resolve_client_shell_targets(&state, client_id)?;
+            let env_block = format!("export OPENAI_BASE_URL={}", HEADROOM_OPENAI_BASE_URL);
+            let mut updates = configure_shell_block(&shell_targets, "codex_cli", &env_block)?;
+            let mut toml_updates = configure_codex_provider_block()?;
+            updates.0.append(&mut toml_updates.0);
+            updates.1.append(&mut toml_updates.1);
+            changed_files.extend(updates.0);
+            backup_files.extend(updates.1);
+            state
+                .managed_shell_files
+                .insert(state_id.clone(), serialize_paths(&shell_targets));
         }
         other => return Err(anyhow!("Automatic setup is not supported yet for {other}.",)),
     }
@@ -166,7 +180,13 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
         backup_files,
         next_steps: vec![
             "Restart your terminal/editor session to pick up environment changes.".into(),
-            "Run one Claude Code prompt and verify activity appears in Headroom.".into(),
+            format!(
+                "Run one {} prompt and verify activity appears in Headroom.",
+                match normalized_setup_id(client_id) {
+                    "codex_cli" => "Codex",
+                    _ => "Claude Code",
+                }
+            ),
         ],
         verification,
     })
@@ -235,10 +255,34 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             delegated.client_id = "vscode".to_string();
             return Ok(delegated);
         }
-        "codex" | "codex_cli" | "codex_gui" => {
-            return Err(anyhow!(
-                "Codex integration has been disabled. Headroom now focuses on Claude Code."
-            ))
+        "codex" | "codex_cli" => {
+            let state = load_setup_state();
+            let shell_targets = resolve_client_shell_targets(&state, client_id)?;
+            let shell_ok = shell_block_contains_in_files(
+                &shell_targets,
+                "codex_cli",
+                "OPENAI_BASE_URL",
+                HEADROOM_OPENAI_BASE_URL,
+            )?;
+            let toml_ok = codex_provider_block_matches()?;
+
+            if shell_ok {
+                checks.push("Found Codex OPENAI_BASE_URL export in managed shell block.".into());
+            }
+            if toml_ok {
+                checks.push(
+                    "Found Headroom-managed provider block in ~/.codex/config.toml.".into(),
+                );
+            }
+            if !toml_ok {
+                failures.push(
+                    "Headroom-managed provider block was not found in ~/.codex/config.toml.".into(),
+                );
+            }
+            if !shell_ok {
+                failures
+                    .push("Codex OPENAI_BASE_URL export was not found in shell profiles.".into());
+            }
         }
         other => return Err(anyhow!("Verification is not supported yet for {other}.",)),
     }
@@ -263,6 +307,10 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
 
 pub fn is_claude_code_enabled() -> bool {
     is_configured(&load_setup_state(), "claude_code")
+}
+
+pub fn is_codex_enabled() -> bool {
+    is_configured(&load_setup_state(), "codex_cli")
 }
 
 pub fn list_client_connectors(
@@ -822,6 +870,7 @@ fn resolve_client_shell_targets(state: &ClientSetupState, client_id: &str) -> Re
     targets.extend(discover_managed_shell_targets(&[
         "claude_code",
         "managed_rtk",
+        "codex_cli",
     ])?);
 
     let default_targets = default_shell_targets_for_family(detect_shell_family());
@@ -1228,6 +1277,56 @@ fn remove_legacy_vscode_base_url_keys() -> Result<(Vec<String>, Vec<String>)> {
 
 fn codex_config_toml_path() -> PathBuf {
     home_dir().join(".codex").join("config.toml")
+}
+
+/// Body of the managed Codex provider block written into `~/.codex/config.toml`.
+/// Mirrors upstream `headroom.providers.codex.install.apply_provider_scope`:
+/// a top-level `model_provider`/`openai_base_url` plus a custom
+/// `[model_providers.headroom]` table pointing at the local proxy. The
+/// `requires_openai_auth` flag is intentionally omitted (it would force Codex
+/// to demand OpenAI OAuth for local-proxy traffic).
+fn codex_provider_block_body() -> String {
+    format!(
+        "model_provider = \"headroom\"\n\
+         openai_base_url = \"{base}\"\n\
+         \n\
+         [model_providers.headroom]\n\
+         name = \"Headroom persistent proxy\"\n\
+         base_url = \"{base}\"\n\
+         supports_websockets = true",
+        base = HEADROOM_OPENAI_BASE_URL,
+    )
+}
+
+fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>)> {
+    let path = codex_config_toml_path();
+    let (changed, backup) = upsert_managed_block(&path, "codex_cli", &codex_provider_block_body())?;
+    let mut changed_files = Vec::new();
+    let mut backup_files = Vec::new();
+    if changed {
+        changed_files.push(path.display().to_string());
+        if let Some(backup_path) = backup {
+            backup_files.push(backup_path.display().to_string());
+        }
+    }
+    Ok((changed_files, backup_files))
+}
+
+fn codex_provider_block_matches() -> Result<bool> {
+    let path = codex_config_toml_path();
+    if !path.exists() {
+        return Ok(false);
+    }
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let start = "# >>> headroom:codex_cli >>>";
+    let end = "# <<< headroom:codex_cli <<<";
+    if let (Some(start_idx), Some(end_idx)) = (content.find(start), content.find(end)) {
+        let block = &content[start_idx..end_idx];
+        let expected = format!("base_url = \"{}\"", HEADROOM_OPENAI_BASE_URL);
+        return Ok(block.contains(&expected));
+    }
+    Ok(false)
 }
 
 fn remove_codex_provider_block() -> Result<()> {
@@ -1948,6 +2047,84 @@ fn claude_code_user_state_exists(home: &Path) -> bool {
         || claude_root.join("projects").exists()
         || claude_root.join("sessions").exists()
         || claude_root.join("statsig").exists()
+}
+
+fn detect_codex_client(configured: bool) -> ClientStatus {
+    let executable = codex_candidate_paths()
+        .into_iter()
+        .find(|path| path.exists())
+        .or_else(|| find_on_path(&["codex"]));
+
+    let detected = executable
+        .as_ref()
+        .map(|path| format!("Detected at {}", path.display()))
+        .or_else(|| {
+            codex_user_state_exists(&home_dir()).then(|| "Detected Codex data in ~/.codex.".into())
+        });
+
+    if let Some(detected_note) = detected {
+        return ClientStatus {
+            id: "codex".into(),
+            name: "Codex".into(),
+            installed: true,
+            configured,
+            health: if configured {
+                ClientHealth::Healthy
+            } else {
+                ClientHealth::Attention
+            },
+            notes: if configured {
+                vec![detected_note, "Configured by Headroom.".into()]
+            } else {
+                vec![
+                    detected_note,
+                    "Route Codex through Headroom's localhost proxy so prompts stay lean.".into(),
+                ]
+            },
+        };
+    }
+
+    ClientStatus {
+        id: "codex".into(),
+        name: "Codex".into(),
+        installed: false,
+        configured: false,
+        health: ClientHealth::NotDetected,
+        notes: vec!["Not detected on this machine yet.".into()],
+    }
+}
+
+fn codex_candidate_paths() -> Vec<PathBuf> {
+    let home = home_dir();
+    let binary_names = ["codex"];
+    let mut candidates = vec![
+        PathBuf::from("/usr/local/bin/codex"),
+        PathBuf::from("/opt/homebrew/bin/codex"),
+    ];
+
+    let user_bin_dirs = vec![
+        home.join(".local").join("bin"),
+        home.join(".cargo").join("bin"),
+        home.join("bin"),
+        home.join(".npm-global").join("bin"),
+        home.join(".yarn").join("bin"),
+        home.join(".volta").join("bin"),
+        home.join(".bun").join("bin"),
+        home.join(".asdf").join("shims"),
+        home.join(".mise").join("shims"),
+        home.join(".nodenv").join("shims"),
+    ];
+
+    candidates.extend(binary_candidates_in_dirs(&user_bin_dirs, &binary_names));
+    candidates.extend(nvm_binary_candidates(&home, &binary_names));
+    dedupe_paths(candidates)
+}
+
+fn codex_user_state_exists(home: &Path) -> bool {
+    let codex_root = home.join(".codex");
+    codex_root.join("config.toml").exists()
+        || codex_root.join("auth.json").exists()
+        || codex_root.join("sessions").exists()
 }
 
 fn parse_json_object(raw: &str, path: &Path) -> Result<serde_json::Map<String, Value>> {
@@ -3060,12 +3237,102 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
-    fn apply_client_setup_rejects_codex() {
-        let _home = TestHome::new();
-        let err = super::apply_client_setup("codex").expect_err("codex disabled");
+    fn apply_then_verify_then_disable_codex_round_trip() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+
+        let result = super::apply_client_setup("codex").expect("apply_client_setup succeeds");
+        assert!(result.applied);
+        assert_eq!(result.client_id, "codex");
+
+        // Managed provider block lands in ~/.codex/config.toml.
+        let config_toml = home.path().join(".codex").join("config.toml");
+        let toml = fs::read_to_string(&config_toml).expect("codex config.toml written");
         assert!(
-            err.to_string().contains("Codex integration has been disabled"),
-            "unexpected error message: {err}"
+            toml.contains("# >>> headroom:codex_cli >>>"),
+            "managed marker present, got:\n{toml}"
+        );
+        assert!(
+            toml.contains("model_provider = \"headroom\""),
+            "model_provider set, got:\n{toml}"
+        );
+        assert!(
+            toml.contains("base_url = \"http://127.0.0.1:6767/v1\""),
+            "provider base_url points at proxy, got:\n{toml}"
+        );
+        assert!(
+            !toml.contains("requires_openai_auth"),
+            "requires_openai_auth must NOT be written, got:\n{toml}"
+        );
+
+        // OPENAI_BASE_URL exported from a managed shell block.
+        let zshrc = fs::read_to_string(home.path().join(".zshrc")).unwrap();
+        let zshenv = fs::read_to_string(home.path().join(".zshenv")).unwrap();
+        let combined = format!("{zshrc}\n{zshenv}");
+        assert!(
+            combined.contains("OPENAI_BASE_URL=http://127.0.0.1:6767/v1"),
+            "OPENAI_BASE_URL exported from a managed shell block, got:\n{combined}"
+        );
+
+        // verify_client_setup reports the configured checks and passes.
+        let verification =
+            super::verify_client_setup("codex").expect("verify_client_setup succeeds");
+        assert_eq!(verification.client_id, "codex");
+        assert!(
+            verification.failures.is_empty(),
+            "no verification failures, got: {:?}",
+            verification.failures
+        );
+        assert!(
+            verification
+                .checks
+                .iter()
+                .any(|c| c.contains("config.toml")),
+            "verification reports the toml check, got: {:?}",
+            verification.checks
+        );
+
+        // Disable strips both the toml block and the shell export.
+        super::disable_client_setup("codex").expect("disable_client_setup succeeds");
+        let toml_after = fs::read_to_string(&config_toml).unwrap_or_default();
+        assert!(
+            !toml_after.contains("# >>> headroom:codex_cli >>>"),
+            "managed block removed on disable, got:\n{toml_after}"
+        );
+        let combined_after = format!(
+            "{}\n{}",
+            fs::read_to_string(home.path().join(".zshrc")).unwrap(),
+            fs::read_to_string(home.path().join(".zshenv")).unwrap(),
+        );
+        assert!(
+            !combined_after.contains("OPENAI_BASE_URL=http://127.0.0.1:6767/v1"),
+            "shell export removed on disable, got:\n{combined_after}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_codex_is_byte_idempotent() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+
+        super::apply_client_setup("codex").expect("first apply");
+        let config_toml = home.path().join(".codex").join("config.toml");
+        let toml_first = fs::read_to_string(&config_toml).unwrap();
+        let zshenv_first = fs::read_to_string(home.path().join(".zshenv")).unwrap();
+
+        super::apply_client_setup("codex").expect("second apply");
+        let toml_second = fs::read_to_string(&config_toml).unwrap();
+        let zshenv_second = fs::read_to_string(home.path().join(".zshenv")).unwrap();
+
+        assert_eq!(toml_first, toml_second, "config.toml byte-stable");
+        assert_eq!(zshenv_first, zshenv_second, "zshenv byte-stable");
+        assert_eq!(
+            toml_second.matches("# >>> headroom:codex_cli >>>").count(),
+            1,
+            "managed block appears exactly once"
         );
     }
 

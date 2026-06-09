@@ -8,8 +8,9 @@ use crate::device;
 use crate::keychain;
 use crate::models::{
     headroom_tier_for_claude_plan, BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod,
-    ClaudePlanTier, ClaudeUsage, ClaudeUsageWindow, HeadroomAccountProfile, HeadroomAuthCodeRequest,
-    HeadroomPricingStatus, HeadroomSubscriptionTier, PricingGateReason, TierMismatch,
+    ClaudePlanTier, ClaudeUsage, ClaudeUsageWindow, CodexUsage, CodexUsageWindow,
+    HeadroomAccountProfile, HeadroomAuthCodeRequest, HeadroomPricingStatus,
+    HeadroomSubscriptionTier, PricingGateReason, TierMismatch,
 };
 use crate::state::AppState;
 use crate::storage::{app_data_dir, config_file};
@@ -409,7 +410,7 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     let last_known_good_plan_tier = state.last_known_good_plan_tier();
     let tier_mismatch = resolve_tier_mismatch(account.as_ref(), &claude);
 
-    Ok(evaluate_pricing_status_with_mismatch(
+    let mut status = evaluate_pricing_status_with_mismatch(
         authenticated,
         local_state.first_seen_at,
         local_grace_ends_at,
@@ -420,7 +421,136 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
         launch_discount_active,
         last_known_good_plan_tier,
         tier_mismatch,
-    ))
+    );
+    status.codex = fetch_codex_usage();
+    Ok(status)
+}
+
+/// Primary-window utilization (%) at which the Codex usage gauge starts nudging.
+const CODEX_NUDGE_THRESHOLD_PCT: f64 = 80.0;
+/// Primary-window utilization (%) treated as "near limit" in the gauge copy.
+const CODEX_NEAR_LIMIT_THRESHOLD_PCT: f64 = 95.0;
+
+/// Fetch the Codex subscription usage snapshot from the local proxy `/stats`
+/// endpoint. Returns `None` when the Codex connector is not enabled, the proxy
+/// is unreachable, or no Codex rate-limit snapshot has been captured yet (the
+/// `codex_rate_limits` key is absent until the first Codex response flows).
+fn fetch_codex_usage() -> Option<CodexUsage> {
+    if !crate::client_adapters::is_codex_enabled() {
+        return None;
+    }
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+        .ok()?;
+
+    for host in ["127.0.0.1", "localhost"] {
+        let url = format!("http://{host}:6767/stats");
+        let Ok(resp) = client.get(&url).send() else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(body) = resp.json::<serde_json::Value>() else {
+            continue;
+        };
+        if let Some(usage) = parse_codex_usage_from_stats(&body) {
+            return Some(usage);
+        }
+    }
+    None
+}
+
+/// Pure parser for the `codex_rate_limits` block of the proxy `/stats` payload.
+/// Extracted so schema-drift tests don't need a live proxy.
+fn parse_codex_usage_from_stats(stats: &serde_json::Value) -> Option<CodexUsage> {
+    let block = stats.get("codex_rate_limits")?;
+    if block.is_null() {
+        return None;
+    }
+
+    let parse_window = |v: &serde_json::Value| -> Option<CodexUsageWindow> {
+        let used_percent = v.get("used_percent")?.as_f64()?;
+        Some(CodexUsageWindow {
+            used_percent,
+            window_label: v
+                .get("window_label")
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
+            window_minutes: v.get("window_minutes").and_then(|x| x.as_i64()),
+            seconds_until_reset: v.get("seconds_until_reset").and_then(|x| x.as_i64()),
+        })
+    };
+
+    let primary = block.get("primary").and_then(parse_window);
+    let secondary = block.get("secondary").and_then(parse_window);
+    let credits = block.get("credits");
+    let credits_balance = credits
+        .and_then(|c| c.get("balance"))
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let credits_unlimited = credits
+        .and_then(|c| c.get("unlimited"))
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let limit_name = block
+        .get("limit_name")
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
+
+    // No usable usage signal — treat as absent.
+    if primary.is_none() && secondary.is_none() && credits_balance.is_none() {
+        return None;
+    }
+
+    let (should_nudge, gate_message) = codex_gate(primary.as_ref());
+
+    Some(CodexUsage {
+        limit_name,
+        primary,
+        secondary,
+        credits_balance,
+        credits_unlimited,
+        should_nudge,
+        gate_message,
+    })
+}
+
+/// Codex usage gate: a display-only nudge derived from primary-window
+/// utilization. Codex billing is OpenAI's, separate from Headroom's account
+/// gate, so this never flips the global (Claude-driven) `optimization_allowed`
+/// — it only surfaces a parallel nudge in the Codex gauge.
+fn codex_gate(primary: Option<&CodexUsageWindow>) -> (bool, String) {
+    let Some(window) = primary else {
+        return (
+            false,
+            "Send a Codex prompt through Headroom to sync your current usage window.".into(),
+        );
+    };
+    let used = window.used_percent;
+    if used >= CODEX_NEAR_LIMIT_THRESHOLD_PCT {
+        (
+            true,
+            format!(
+                "You're at {used:.0}% of your Codex usage window. You're close to the limit — Headroom keeps your prompts lean to stretch it further."
+            ),
+        )
+    } else if used >= CODEX_NUDGE_THRESHOLD_PCT {
+        (
+            true,
+            format!(
+                "You're at {used:.0}% of your Codex usage window. Headroom is trimming context to keep you under the limit."
+            ),
+        )
+    } else {
+        (
+            false,
+            format!("Codex usage is at {used:.0}% of the current window."),
+        )
+    }
 }
 
 pub fn request_auth_code(state: &AppState, email: &str) -> Result<HeadroomAuthCodeRequest, String> {
@@ -1019,6 +1149,7 @@ fn evaluate_pricing_status_with_mismatch(
         recommended_subscription_tier,
         tier_mismatch,
         claude,
+        codex: None,
         account,
         launch_discount_active,
     }
@@ -2997,6 +3128,92 @@ mod tests {
         });
         let usage = super::parse_claude_usage_response(&body).expect("parse");
         assert!(usage.five_hour.is_none());
+    }
+
+    // ── codex usage parse (codex_rate_limits in /stats) ─────────────────────
+    #[test]
+    fn parse_codex_usage_from_stats_decodes_block() {
+        let stats = serde_json::json!({
+            "codex_rate_limits": {
+                "limit_id": "codex",
+                "limit_name": "gpt-5.2-codex",
+                "primary": {
+                    "used_percent": 42.5,
+                    "window_minutes": 300,
+                    "window_label": "5h",
+                    "seconds_until_reset": 7200
+                },
+                "secondary": {
+                    "used_percent": 12.0,
+                    "window_label": "7d",
+                    "seconds_until_reset": 86400
+                },
+                "credits": { "unlimited": false, "balance": "$5.00" }
+            }
+        });
+        let usage = super::parse_codex_usage_from_stats(&stats).expect("codex usage");
+        assert_eq!(usage.limit_name.as_deref(), Some("gpt-5.2-codex"));
+        let primary = usage.primary.expect("primary window");
+        assert_eq!(primary.used_percent, 42.5);
+        assert_eq!(primary.window_label.as_deref(), Some("5h"));
+        assert_eq!(primary.window_minutes, Some(300));
+        assert_eq!(primary.seconds_until_reset, Some(7200));
+        let secondary = usage.secondary.expect("secondary window");
+        assert_eq!(secondary.window_label.as_deref(), Some("7d"));
+        assert_eq!(usage.credits_balance.as_deref(), Some("$5.00"));
+        assert!(!usage.credits_unlimited);
+        assert!(!usage.should_nudge, "42% is below nudge threshold");
+    }
+
+    #[test]
+    fn parse_codex_usage_from_stats_absent_key_returns_none() {
+        let stats = serde_json::json!({ "subscription_window": {} });
+        assert!(super::parse_codex_usage_from_stats(&stats).is_none());
+    }
+
+    #[test]
+    fn parse_codex_usage_from_stats_null_block_returns_none() {
+        let stats = serde_json::json!({ "codex_rate_limits": null });
+        assert!(super::parse_codex_usage_from_stats(&stats).is_none());
+    }
+
+    #[test]
+    fn parse_codex_usage_from_stats_no_signal_returns_none() {
+        // Block present but no windows and no credits balance.
+        let stats = serde_json::json!({
+            "codex_rate_limits": { "limit_name": "codex", "credits": { "unlimited": false } }
+        });
+        assert!(super::parse_codex_usage_from_stats(&stats).is_none());
+    }
+
+    #[test]
+    fn codex_gate_nudges_above_threshold() {
+        let near = super::CodexUsageWindow {
+            used_percent: 96.0,
+            window_label: Some("5h".into()),
+            window_minutes: Some(300),
+            seconds_until_reset: Some(60),
+        };
+        let (nudge, msg) = super::codex_gate(Some(&near));
+        assert!(nudge);
+        assert!(msg.contains("96%"));
+
+        let mid = super::CodexUsageWindow {
+            used_percent: 85.0,
+            ..near.clone()
+        };
+        let (nudge, _) = super::codex_gate(Some(&mid));
+        assert!(nudge);
+
+        let low = super::CodexUsageWindow {
+            used_percent: 20.0,
+            ..near
+        };
+        let (nudge, _) = super::codex_gate(Some(&low));
+        assert!(!nudge);
+
+        let (nudge, _) = super::codex_gate(None);
+        assert!(!nudge);
     }
 
     // ── headroom-web auth contract tests ────────────────────────────────────
