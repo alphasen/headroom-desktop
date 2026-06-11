@@ -1,0 +1,6 @@
+# Per-test timeout so a single hung test can never stall the whole job.
+# A deadlocked dashboard test (rc12) once ran for ~24 minutes until the
+# release job was canceled; terminate-after converts that into a fast
+# per-test failure instead.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 3 }

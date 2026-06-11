@@ -20,6 +20,7 @@ jobs:
   release:
     name: macOS Apple Silicon (Staging)
     runs-on: macos-latest
+    timeout-minutes: 45
 
     env:
       HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
@@ -58,6 +59,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -159,6 +165,7 @@ jobs:
 
       - name: Run release checks
         if: steps.release_guard.outputs.should_release == 'true'
+        timeout-minutes: 12
         run: ./scripts/verify-release.sh
 
       - name: Build and publish versioned rc release

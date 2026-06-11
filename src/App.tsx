@@ -4556,7 +4556,7 @@ export default function App() {
             ) : null}
           </section>
 
-          {!activeHeadroomPlanId ? (
+          {!pricingStatus?.account?.subscriptionActive ? (
             <>
               <section
                 className={`upgrade-trial-callout upgrade-trial-callout--${upgradeTrialCallout.tone}`}
@@ -4578,38 +4578,85 @@ export default function App() {
                 ) : null}
               </section>
 
-              {pricingStatus?.launchDiscountActive ? (
-                <section className="upgrade-trial-callout upgrade-sale-banner">
-                  <p className="upgrade-trial-callout__message">
-                    🎉 {pricingStatus.activePercentOff ?? 0}% off all paid plans — founder pricing
-                  </p>
-                </section>
-              ) : null}
+              {pricingStatus?.launchDiscountActive
+                ? (() => {
+                    const cohorts = pricingStatus.pricingCohorts ?? [];
+                    const active = cohorts.find((c) => c.status === "active");
+                    const pct = pricingStatus.activePercentOff ?? active?.percentOff ?? 0;
+                    const spotsLeft = active?.spotsLeft ?? null;
+                    const capacity = active?.capacity ?? null;
+                    const filledPct =
+                      capacity && spotsLeft != null
+                        ? Math.max(4, Math.min(100, Math.round(((capacity - spotsLeft) / capacity) * 100)))
+                        : null;
+                    const firstUpcoming = cohorts.find((c) => c.status === "upcoming")?.key;
+                    return (
+                      <section className="founder-promo" aria-label="Founder pricing">
+                        <div className="founder-promo__head">
+                          <div className="founder-promo__urgency">
+                            {spotsLeft != null ? (
+                              <>
+                                <span className="founder-promo__count">{spotsLeft}</span>
+                                <span className="founder-promo__count-label">founder spots left</span>
+                              </>
+                            ) : (
+                              <span className="founder-promo__count-label">Founder pricing</span>
+                            )}
+                          </div>
+                          <span className="founder-promo__discount">{pct}% off</span>
+                        </div>
 
-              {pricingStatus?.pricingCohorts && pricingStatus.pricingCohorts.length > 0 ? (
-                <ol className="pricing-ladder" aria-label="Founder pricing ladder">
-                  {pricingStatus.pricingCohorts.map((cohort) => (
-                    <li
-                      key={cohort.key}
-                      className={`pricing-ladder__step pricing-ladder__step--${cohort.status}`}
-                    >
-                      <span className="pricing-ladder__label">{cohort.label}</span>
-                      <span className="pricing-ladder__percent">
-                        {cohort.percentOff > 0 ? `${cohort.percentOff}% off` : "Full price"}
-                      </span>
-                      <span className="pricing-ladder__status">
-                        {cohort.status === "sold_out"
-                          ? "Sold out"
-                          : cohort.status === "active"
-                          ? cohort.spotsLeft != null
-                            ? `${cohort.spotsLeft} spots left`
-                            : "Available now"
-                          : "Up next"}
-                      </span>
-                    </li>
-                  ))}
-                </ol>
-              ) : null}
+                        {filledPct != null ? (
+                          <div className="founder-promo__bar" role="presentation">
+                            <span
+                              className="founder-promo__bar-fill"
+                              style={{ width: `${filledPct}%` }}
+                            />
+                          </div>
+                        ) : null}
+
+                        {cohorts.length > 0 ? (
+                          <>
+                            <ol className="founder-ladder" aria-label="Founder pricing ladder">
+                              {cohorts.map((cohort) => {
+                                const stage =
+                                  cohort.status === "active"
+                                    ? "now"
+                                    : cohort.status === "sold_out"
+                                    ? "gone"
+                                    : cohort.key === firstUpcoming
+                                    ? "next"
+                                    : "later";
+                                return (
+                                  <li
+                                    key={cohort.key}
+                                    className={`founder-ladder__step founder-ladder__step--${stage}`}
+                                  >
+                                    <span className="founder-ladder__percent">
+                                      {cohort.percentOff > 0 ? `${cohort.percentOff}%` : "Full"}
+                                    </span>
+                                    <span className="founder-ladder__tag">
+                                      {stage === "now"
+                                        ? "Now"
+                                        : stage === "next"
+                                        ? "Next"
+                                        : stage === "gone"
+                                        ? "Gone"
+                                        : ""}
+                                    </span>
+                                  </li>
+                                );
+                              })}
+                            </ol>
+                            <p className="founder-promo__foot">
+                              Price rises as founder spots fill. Your rate is locked in for good.
+                            </p>
+                          </>
+                        ) : null}
+                      </section>
+                    );
+                  })()
+                : null}
             </>
           ) : null}
 

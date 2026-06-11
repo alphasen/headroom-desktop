@@ -863,3 +863,112 @@ pub struct HeadroomAuthCodeRequest {
     pub expires_in_seconds: u64,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn codex_plan_tier_round_trips_as_snake_case() {
+        for (tier, wire) in [
+            (CodexPlanTier::Free, "free"),
+            (CodexPlanTier::Plus, "plus"),
+            (CodexPlanTier::Enterprise, "enterprise"),
+            (CodexPlanTier::Unknown, "unknown"),
+        ] {
+            assert_eq!(serde_json::to_value(tier).unwrap(), json!(wire));
+            let parsed: CodexPlanTier = serde_json::from_value(json!(wire)).unwrap();
+            assert_eq!(parsed, tier);
+        }
+    }
+
+    #[test]
+    fn codex_plan_tier_from_claim_is_trimmed_case_insensitive_with_unknown_fallback() {
+        assert_eq!(CodexPlanTier::from_claim("Plus"), CodexPlanTier::Plus);
+        assert_eq!(CodexPlanTier::from_claim("  TEAM "), CodexPlanTier::Team);
+        assert_eq!(CodexPlanTier::from_claim("chatgptpaidplan"), CodexPlanTier::Unknown);
+        assert_eq!(CodexPlanTier::from_claim(""), CodexPlanTier::Unknown);
+    }
+
+    #[test]
+    fn codex_plan_maps_to_price_parity_headroom_tier() {
+        use HeadroomSubscriptionTier::*;
+        assert_eq!(headroom_tier_for_codex_plan(&CodexPlanTier::Plus), Some(Pro));
+        assert_eq!(headroom_tier_for_codex_plan(&CodexPlanTier::Pro), Some(Max20x));
+        for plan in [
+            CodexPlanTier::Team,
+            CodexPlanTier::Business,
+            CodexPlanTier::Enterprise,
+            CodexPlanTier::Edu,
+        ] {
+            assert_eq!(headroom_tier_for_codex_plan(&plan), Some(Max5x));
+        }
+        assert_eq!(headroom_tier_for_codex_plan(&CodexPlanTier::Free), None);
+        assert_eq!(headroom_tier_for_codex_plan(&CodexPlanTier::Unknown), None);
+    }
+
+    #[test]
+    fn codex_usage_window_deserializes_camel_case_keys() {
+        let parsed: CodexUsageWindow = serde_json::from_value(json!({
+            "usedPercent": 42.5,
+            "windowLabel": "7d",
+            "windowMinutes": 10080,
+            "secondsUntilReset": 3600,
+        }))
+        .unwrap();
+        assert_eq!(parsed.used_percent, 42.5);
+        assert_eq!(parsed.window_label.as_deref(), Some("7d"));
+        assert_eq!(parsed.window_minutes, Some(10080));
+        assert_eq!(parsed.seconds_until_reset, Some(3600));
+    }
+
+    #[test]
+    fn codex_usage_serializes_camel_case_and_round_trips() {
+        let usage = CodexUsage {
+            limit_name: Some("codex".into()),
+            secondary: Some(CodexUsageWindow {
+                used_percent: 80.0,
+                window_label: Some("7d".into()),
+                window_minutes: Some(10080),
+                seconds_until_reset: None,
+            }),
+            optimization_allowed: true,
+            should_nudge: true,
+            nudge_level: 2,
+            weekly_used_percent: Some(80.0),
+            gate_message: "Approaching weekly limit".into(),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&usage).unwrap();
+        // Wire contract for the TS frontend: camelCase keys, not snake_case.
+        for key in ["optimizationAllowed", "shouldNudge", "nudgeLevel", "gateMessage"] {
+            assert!(value.get(key).is_some(), "missing camelCase key {key}");
+        }
+        assert!(value.get("optimization_allowed").is_none());
+
+        let back: CodexUsage = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), value);
+        assert_eq!(back.nudge_level, 2);
+        assert_eq!(back.secondary.unwrap().used_percent, 80.0);
+        assert!(back.primary.is_none());
+    }
+
+    #[test]
+    fn pricing_cohort_defaults_optional_capacity_fields_when_absent() {
+        // headroom-web omits capacity/spotsLeft for sold-out and upcoming rungs;
+        // the #[serde(default)] contract must keep those payloads deserializable.
+        let cohort: PricingCohort = serde_json::from_value(json!({
+            "key": "founder",
+            "label": "Founder",
+            "percentOff": 40,
+            "status": "active",
+        }))
+        .unwrap();
+        assert_eq!(cohort.percent_off, 40);
+        assert_eq!(cohort.status, "active");
+        assert_eq!(cohort.capacity, None);
+        assert_eq!(cohort.spots_left, None);
+    }
+}
+
