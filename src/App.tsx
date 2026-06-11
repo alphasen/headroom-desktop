@@ -66,6 +66,7 @@ import {
   getPlanCycleTotalLabel,
   getPlanRenewalPriceLabel,
   getUpgradePlans,
+  getFounderStepPricing,
   isTierDowngrade,
   upgradePlanIntentLabel,
   type BillingPeriod,
@@ -4591,8 +4592,19 @@ export default function App() {
                         ? Math.max(4, Math.min(100, Math.round(((capacity - spotsLeft) / capacity) * 100)))
                         : null;
                     const next = cohorts.find((c) => c.status === "upcoming") ?? null;
+                    const stepPricing = getFounderStepPricing(
+                      upgradePlansState.featuredPlanId,
+                      billingPeriod,
+                      pct,
+                      next?.percentOff ?? 0
+                    );
                     return (
                       <section className="founder-promo" aria-label="Founder pricing">
+                        <p className="founder-promo__intro">
+                          <span className="founder-promo__live" aria-hidden="true" />
+                          Launch promotion active. Prices rise as {activeLabel.toLowerCase()} spots
+                          fill. Your price is locked in for good.
+                        </p>
                         <div className="founder-promo__head">
                           <div className="founder-promo__urgency">
                             {spotsLeft != null ? (
@@ -4606,13 +4618,23 @@ export default function App() {
                           </div>
                           <div className="founder-promo__steps">
                             <div className="founder-promo__step founder-promo__step--now">
-                              <span className="founder-promo__step-pct">{pct}% OFF</span>
+                              <span className="founder-promo__step-line">
+                                {stepPricing ? (
+                                  <span className="founder-promo__step-price">{stepPricing.now}/mo</span>
+                                ) : null}
+                                <span className="founder-promo__step-pct">{pct}% off</span>
+                              </span>
                               <span className="founder-promo__step-tag">Now</span>
                             </div>
                             {next ? (
                               <div className="founder-promo__step founder-promo__step--next">
-                                <span className="founder-promo__step-pct">
-                                  {next.percentOff > 0 ? `${next.percentOff}% OFF` : "Full price"}
+                                <span className="founder-promo__step-line">
+                                  {stepPricing ? (
+                                    <span className="founder-promo__step-price">{stepPricing.next}/mo</span>
+                                  ) : null}
+                                  <span className="founder-promo__step-pct">
+                                    {next.percentOff > 0 ? `${next.percentOff}% off` : "Full price"}
+                                  </span>
                                 </span>
                                 <span className="founder-promo__step-tag">Next</span>
                               </div>

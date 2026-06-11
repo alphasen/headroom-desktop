@@ -65,6 +65,24 @@ export function getPlanRenewalPriceLabel(
   return `${formatCents(projectPerMonthCents(toTier, billingPeriod, options))} / month`;
 }
 
+/// Founder-promo step prices for the plan matched to the user's Claude/Codex
+/// tier: the current discounted price (`now`) and the price at the next cohort's
+/// percent (`next`). Returns null for plans without a fixed price (free / team /
+/// enterprise) so the promo can fall back to percent-only chips.
+export function getFounderStepPricing(
+  planId: UpgradePlanId,
+  billingPeriod: BillingPeriod,
+  nowPercentOff: number,
+  nextPercentOff: number
+): { now: string; next: string } | null {
+  if (planId !== "pro" && planId !== "max5x" && planId !== "max20x") return null;
+  const fullCents = PLAN_PRICES[planId][billingPeriod].fullCents;
+  return {
+    now: discountedPriceLabel(fullCents, nowPercentOff),
+    next: discountedPriceLabel(fullCents, nextPercentOff),
+  };
+}
+
 /// Total amount charged on a single billing cycle (e.g. `$120` for a 50%-off
 /// Max x5 annual subscriber paying $10/month for 12 months upfront). Used in
 /// the upgrade confirmation modal when telling a checkout-bound user the

@@ -2723,7 +2723,28 @@ impl AppState {
                 .arg("-TERM")
                 .arg(format!("-{pid}"))
                 .status();
-            let _ = child.wait();
+            // Bounded wait: a backend that ignores SIGTERM (mid-request, stuck
+            // shutdown) must not block this caller forever. stop_headroom runs
+            // on the UI thread during restart_app, so an unbounded child.wait()
+            // freezes the app ("not responding"). Give it ~2s, then SIGKILL the
+            // process group and reap.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            let _ = std::process::Command::new("/bin/kill")
+                                .arg("-KILL")
+                                .arg(format!("-{pid}"))
+                                .status();
+                            let _ = child.wait();
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }
+            }
         }
 
         // Also clean up detached/orphaned Headroom-managed headroom proxies
