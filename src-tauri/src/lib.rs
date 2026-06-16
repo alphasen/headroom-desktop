@@ -3006,6 +3006,12 @@ pub fn run() {
             ) {
                 let state: tauri::State<'_, AppState> = app.state();
                 state.stop_headroom();
+                // Hand Codex threads back to the native provider so its history
+                // menu stays whole while Headroom is not running. Cmd-Q / dock
+                // quit / signals skip exit_headroom -> clear_client_setups, so
+                // this is the only retag they get; the next launch re-applies the
+                // headroom tag via restore_client_setups. Best-effort.
+                client_adapters::retag_codex_threads_to_native();
             }
         });
 }

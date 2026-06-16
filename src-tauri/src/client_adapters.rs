@@ -196,6 +196,9 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
             state
                 .managed_shell_files
                 .insert(state_id.clone(), serialize_paths(&shell_targets));
+            // Pull existing native threads into the headroom-provider menu so the
+            // Codex history list stays whole once it routes through Headroom.
+            retag_codex_thread_providers(CODEX_NATIVE_PROVIDER, CODEX_HEADROOM_PROVIDER);
         }
         other => return Err(anyhow!("Automatic setup is not supported yet for {other}.",)),
     }
@@ -397,6 +400,9 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
         "codex" | "codex_cli" => {
             disable_codex_cli()?;
             disable_codex_gui()?;
+            // Hand the threads back to the native-provider menu so the full
+            // history stays visible once Codex no longer routes through Headroom.
+            retag_codex_thread_providers(CODEX_HEADROOM_PROVIDER, CODEX_NATIVE_PROVIDER);
         }
         "codex_gui" => {
             disable_codex_gui()?;
@@ -1384,6 +1390,79 @@ fn codex_config_toml_path() -> PathBuf {
 // `codex_uses_chatgpt_auth`.
 const CODEX_ROOT_BLOCK_ID: &str = "codex_cli";
 const CODEX_TABLE_BLOCK_ID: &str = "codex_cli_provider";
+
+// Codex permanently stamps every thread with the `model_provider` it ran under,
+// and its history/projects menu filters threads by the *active* provider set. So
+// threads created through Headroom (provider `headroom`) disappear from the menu
+// when Codex runs natively (provider `openai`) and vice-versa. To keep the menu
+// whole we retag threads to match whichever provider is currently active:
+// `openai -> headroom` on connect, `headroom -> openai` on disconnect/quit.
+const CODEX_HEADROOM_PROVIDER: &str = "headroom";
+const CODEX_NATIVE_PROVIDER: &str = "openai";
+
+/// Both known Codex state stores: the v148 GUI reads
+/// `~/.codex/sqlite/state_5.sqlite`, the CLI/TUI uses `~/.codex/state_5.sqlite`.
+fn codex_state_db_paths() -> Vec<PathBuf> {
+    let codex = home_dir().join(".codex");
+    vec![
+        codex.join("sqlite").join("state_5.sqlite"),
+        codex.join("state_5.sqlite"),
+    ]
+}
+
+/// Best-effort retag of Codex thread provider tags so the history menu stays
+/// whole across the Headroom proxy boundary. Never fails the caller: a missing
+/// store, a missing `threads` table, or a DB locked by a running Codex is logged
+/// and skipped. Only rows whose `model_provider` equals `from` are touched, so
+/// third-party providers are left alone.
+fn retag_codex_thread_providers(from: &str, to: &str) {
+    for path in codex_state_db_paths() {
+        if !path.exists() {
+            continue;
+        }
+        match retag_one_codex_db(&path, from, to) {
+            Ok(0) => {}
+            Ok(n) => log::info!(
+                "codex retag {from}->{to}: {n} thread(s) in {}",
+                path.display()
+            ),
+            Err(e) => log::warn!(
+                "codex retag {from}->{to} skipped for {}: {e}",
+                path.display()
+            ),
+        }
+    }
+}
+
+fn retag_one_codex_db(path: &Path, from: &str, to: &str) -> rusqlite::Result<usize> {
+    use rusqlite::OptionalExtension;
+
+    let conn = rusqlite::Connection::open(path)?;
+    conn.busy_timeout(Duration::from_millis(750))?;
+    // No-op (without erroring) on builds whose store lacks the threads table.
+    let has_table = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_table {
+        return Ok(0);
+    }
+    conn.execute(
+        "UPDATE threads SET model_provider = ?2 WHERE model_provider = ?1",
+        rusqlite::params![from, to],
+    )
+}
+
+/// Retag Codex threads back to the native provider. Exposed for the app-quit
+/// hook in `lib.rs`, which covers exit paths (Cmd-Q, dock quit, signals) that
+/// bypass `clear_client_setups` and therefore the disconnect retag.
+pub fn retag_codex_threads_to_native() {
+    retag_codex_thread_providers(CODEX_HEADROOM_PROVIDER, CODEX_NATIVE_PROVIDER);
+}
 
 fn codex_root_keys_body() -> String {
     format!(
@@ -2443,10 +2522,12 @@ mod tests {
         build_headroom_rtk_hook, claude_code_user_state_exists, claude_hook_present_in_value,
         default_shell_targets_for_family, entry_contains_hook, find_on_path_entries,
         normalize_setup_state, normalized_setup_id, nvm_binary_candidates, parse_json_object,
-        remove_managed_block, serialize_paths, shell_block_contains_in_files,
-        shell_block_contains_text_in_files, shell_double_quote, strip_headroom_hook_from_settings,
-        upsert_managed_block, write_file_if_changed, ClientSetupState, ShellFamily,
+        remove_managed_block, retag_codex_thread_providers, retag_one_codex_db, serialize_paths,
+        shell_block_contains_in_files, shell_block_contains_text_in_files, shell_double_quote,
+        strip_headroom_hook_from_settings, upsert_managed_block, write_file_if_changed,
+        ClientSetupState, ShellFamily,
     };
+    use rusqlite::Connection;
 
     #[test]
     fn normalize_setup_state_keeps_codex_but_drops_legacy_codex_gui() {
@@ -3817,5 +3898,77 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let state = super::load_setup_state();
         assert!(state.configured_clients.is_empty());
         assert!(state.remembered_clients.is_empty());
+    }
+
+    fn seed_codex_threads_db(path: &Path, rows: &[(&str, &str)]) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        for (id, provider) in rows {
+            conn.execute(
+                "INSERT INTO threads (id, model_provider) VALUES (?, ?)",
+                [id, provider],
+            )
+            .unwrap();
+        }
+    }
+
+    fn provider_count(path: &Path, provider: &str) -> i64 {
+        let conn = Connection::open(path).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM threads WHERE model_provider = ?1",
+            [provider],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn retag_one_codex_db_moves_only_matching_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("state_5.sqlite");
+        seed_codex_threads_db(
+            &db,
+            &[
+                ("a", "openai"),
+                ("b", "openai"),
+                ("c", "headroom"),
+                ("d", "anthropic"),
+            ],
+        );
+
+        let moved = retag_one_codex_db(&db, "openai", "headroom").unwrap();
+        assert_eq!(moved, 2);
+        assert_eq!(provider_count(&db, "openai"), 0);
+        assert_eq!(provider_count(&db, "headroom"), 3);
+        // Third-party providers are untouched.
+        assert_eq!(provider_count(&db, "anthropic"), 1);
+
+        // Reverse direction round-trips only the headroom rows.
+        let back = retag_one_codex_db(&db, "headroom", "openai").unwrap();
+        assert_eq!(back, 3);
+        assert_eq!(provider_count(&db, "headroom"), 0);
+        assert_eq!(provider_count(&db, "openai"), 3);
+        assert_eq!(provider_count(&db, "anthropic"), 1);
+    }
+
+    #[test]
+    fn retag_one_codex_db_noop_without_threads_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("state_5.sqlite");
+        // Open creates an empty DB with no `threads` table.
+        Connection::open(&db).unwrap();
+        assert_eq!(retag_one_codex_db(&db, "openai", "headroom").unwrap(), 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn retag_codex_thread_providers_silent_when_no_store() {
+        let _home = TestHome::new();
+        // No ~/.codex stores exist under the temp home: must not panic.
+        retag_codex_thread_providers("openai", "headroom");
     }
 }
