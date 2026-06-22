@@ -486,6 +486,47 @@ impl ToolManager {
         self.runtime.bin_dir.join("rtk")
     }
 
+    /// Seed the output-shaper savings baseline by mining the user's Claude Code
+    /// transcripts once. The proxy's `/stats` `output_shaping` estimate stays
+    /// `available: false` until this baseline exists, so without it the
+    /// dashboard would never show an output-reduction number. `--verbosity
+    /// --apply --all` is heuristic-only (no `--llm-judge`), so it needs no API
+    /// key or network — it reads `~/.claude/projects/*/*.jsonl` and writes the
+    /// baseline into `~/.headroom/output_savings.json` (the same `workspace_dir`
+    /// the proxy's recorder reads). Best-effort and idempotent: it skips when a
+    /// baseline is already present. Meant to run on a background thread — the
+    /// transcript scan can take several seconds. The learned verbosity level it
+    /// also writes is intentionally ignored: the spawn pins
+    /// `HEADROOM_VERBOSITY_LEVEL=2`, which is the manual-override tier.
+    pub fn seed_verbosity_baseline_if_needed(&self) {
+        if verbosity_baseline_present() {
+            return;
+        }
+        let entrypoint = self.headroom_entrypoint();
+        if !entrypoint.exists() {
+            return;
+        }
+        let args = ["learn", "--verbosity", "--apply", "--all"];
+        match build_command(&entrypoint, &args, &self.runtime.root_dir)
+            .stdin(Stdio::null())
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                log::info!("seeded output-shaper verbosity baseline");
+            }
+            Ok(out) => {
+                log::info!(
+                    "verbosity baseline seeding exited {}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Err(err) => {
+                log::info!("verbosity baseline seeding failed to spawn: {err:#}");
+            }
+        }
+    }
+
     pub fn headroom_learn_log_path(&self, project_path: &str) -> PathBuf {
         let logs_dir = self.runtime.logs_dir();
         let project_name = Path::new(project_path)
@@ -737,14 +778,20 @@ impl ToolManager {
                     // the system prompt (after the cache_control breakpoint, so the
                     // provider prefix cache is preserved) and lowers an
                     // already-present output_config.effort on mechanically-classified
-                    // turns. Off by default upstream; enabled here. Remaining knobs
-                    // use upstream defaults: HEADROOM_VERBOSITY_LEVEL=2 (skip
-                    // pre/postamble, don't restate in-context code/tool output),
-                    // HEADROOM_EFFORT_ROUTER on, HEADROOM_MECHANICAL_EFFORT=low. The
+                    // turns. Off by default upstream; enabled here. Effort router
+                    // and mechanical-effort use upstream defaults (on, "low"). The
                     // shaper only ever lowers an effort the client already sent and
                     // never toggles thinking.type, so it cannot 400 a model that
                     // lacks effort support.
                     .env("HEADROOM_OUTPUT_SHAPER", "1")
+                    // Pin the steering level explicitly. An explicit env is the
+                    // manual-override tier in the shaper's level resolution, so it
+                    // wins over the per-user learned level written to verbosity.json
+                    // by the baseline-seeding `learn --verbosity` run. That keeps
+                    // steering uniform/predictable across users while the seeded
+                    // baseline still feeds the /stats savings estimate. Level 2 =
+                    // skip pre/postamble, don't restate in-context code/tool output.
+                    .env("HEADROOM_VERBOSITY_LEVEL", "2")
                     .stdin(Stdio::null())
                     .stdout(Stdio::from(
                         log_file
@@ -4345,6 +4392,38 @@ fn bootstrap_requirements_lock_for_target(os: &str) -> &'static str {
 
 fn run_python_command(python: &Path, args: &[&str], cwd: &Path) -> Result<()> {
     run_command(python, args, cwd)
+}
+
+/// Path to the output-shaper savings ledger. Mirrors headroom's
+/// `workspace_dir()` default of `~/.headroom` (neither the proxy nor the
+/// seeding run sets `HEADROOM_WORKSPACE_DIR`, so both resolve here).
+fn output_savings_ledger_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join(".headroom")
+            .join("output_savings.json"),
+    )
+}
+
+/// True once the verbosity baseline has been seeded (non-empty sample count).
+/// `learn --verbosity` writes `baseline.total_samples`; the proxy reports the
+/// savings estimate as unavailable until it is > 0.
+fn verbosity_baseline_present() -> bool {
+    let Some(path) = output_savings_ledger_path() else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|json| {
+            json.get("baseline")
+                .and_then(|b| b.get("total_samples"))
+                .and_then(|n| n.as_u64())
+        })
+        .is_some_and(|n| n > 0)
 }
 
 fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {

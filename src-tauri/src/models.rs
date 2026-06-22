@@ -116,6 +116,21 @@ pub enum LaunchExperience {
     Dashboard,
 }
 
+/// Honestly-labelled output-token reduction estimate surfaced from the proxy's
+/// `/stats`. `method` is "estimated" (synthetic control vs a learned baseline)
+/// or "measured" (A/B holdout); the percentage carries a 95% confidence band
+/// (`ci_low_percent`..`ci_high_percent`). Output savings are counterfactual, so
+/// this is never presented as an exact count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputReduction {
+    pub method: String,
+    pub reduction_percent: f64,
+    pub ci_low_percent: f64,
+    pub ci_high_percent: f64,
+    pub requests: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DailySavingsPoint {
@@ -166,6 +181,10 @@ pub struct DashboardState {
     pub session_estimated_savings_usd: f64,
     pub session_estimated_tokens_saved: u64,
     pub session_savings_pct: f64,
+    /// Counterfactual output-token reduction from the proxy's output shaper.
+    /// `None` until a verbosity baseline is seeded (the dashboard hides the stat
+    /// until then). Always honestly labelled (`method` + confidence band).
+    pub output_reduction: Option<OutputReduction>,
     pub daily_savings: Vec<DailySavingsPoint>,
     pub hourly_savings: Vec<HourlySavingsPoint>,
     /// True once native savings history has loaded at least once this process.

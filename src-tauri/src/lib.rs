@@ -736,6 +736,14 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             // indefinitely. The test screen will show a retry option.
         } else {
             port_conflict::note_proxy_started(&app_handle);
+            // Seed the output-shaper savings baseline in the background so the
+            // dashboard's output-reduction estimate can populate. Idempotent
+            // (skips once a baseline exists) and best-effort; detached so the
+            // several-second transcript scan never delays bootstrap completion.
+            {
+                let tool_manager = state.tool_manager.clone();
+                std::thread::spawn(move || tool_manager.seed_verbosity_baseline_if_needed());
+            }
             // The intercept layer on 6767 is always bound by the Rust app, so
             // reachability really means "headroom's backend on 6768 is up".
             // We probe it by hitting 6767/health — the intercept forwards to

@@ -2242,6 +2242,50 @@ select {
   margin-top: 12px;
 }
 
+/* Output-shaper reduction estimate: a single labelled figure with a confidence
+   band, distinct from the input-compression time-series chart below it. All
+   colors come from semantic tokens, so dark mode needs no separate override. */
+.output-reduction {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-sunken);
+}
+
+.output-reduction__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.output-reduction__label {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.output-reduction__badge {
+  font-size: var(--text-xxs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--chip-bg);
+  color: var(--chip-text);
+}
+
+.output-reduction__value {
+  margin-top: 2px;
+  font-size: var(--text-lg);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.output-reduction__meta {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
 /* Startup placeholder shown until native savings history loads, so the sparse
    tracker-only chart is never flashed. Tokens carry their own dark values, so
    no separate dark-mode override is needed. */

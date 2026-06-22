@@ -161,6 +161,7 @@ import type {
   ActivityFeedResponse,
   AppliedPatterns,
   HourlySavingsPoint,
+  OutputReduction,
   RuntimeStatus,
   RuntimeUpgradeFailure,
   RuntimeUpgradeProgress,
@@ -380,6 +381,34 @@ function delay(ms: number) {
 
 type SavingsChartView = "month" | "day";
 type SavingsChartMode = "usd" | "tokens";
+
+// Output-token reduction from the proxy's output shaper. This is a single
+// aggregate estimate with a confidence band, not a time series, so it renders
+// as a labelled summary line above the savings chart rather than a chart line.
+// Always shows the method ("estimated"/"measured") and CI so the counterfactual
+// nature is explicit. Caller only renders this when `reduction` is present
+// (the backend returns null until a verbosity baseline is seeded).
+function OutputReductionStat({ reduction }: { reduction: OutputReduction }) {
+  const isMeasured = reduction.method === "measured";
+  return (
+    <div className="output-reduction" title={
+      isMeasured
+        ? "Output tokens the model didn't emit because the shaper steered verbosity / routed effort down. Measured via an A/B holdout, with a 95% confidence band."
+        : "Output tokens the model didn't emit because the shaper steered verbosity / routed effort down. Output savings are counterfactual, so this is an estimate vs a learned baseline, shown with a 95% confidence band."
+    }>
+      <div className="output-reduction__head">
+        <span className="output-reduction__label">Output reduction</span>
+        <span className="output-reduction__badge">{isMeasured ? "measured" : "estimated"}</span>
+      </div>
+      <div className="output-reduction__value">{percent1(reduction.reductionPercent)}%</div>
+      <div className="output-reduction__meta">
+        95% CI {percent1(reduction.ciLowPercent)}–{percent1(reduction.ciHighPercent)}%
+        {" · "}
+        {compactNumber(reduction.requests)} requests
+      </div>
+    </div>
+  );
+}
 
 function DailySavingsChart({
   data,
@@ -4365,6 +4394,10 @@ export default function App() {
                 </strong>
               </article>
             </section>
+
+            {dashboard.outputReduction ? (
+              <OutputReductionStat reduction={dashboard.outputReduction} />
+            ) : null}
 
             {dashboard.savingsHistoryLoaded || historyLoadTimedOut ? (
               <DailySavingsChart
