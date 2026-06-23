@@ -3679,7 +3679,7 @@ export default function App() {
           <>
             {!bootstrapping && (
               <p className="install-pre-notice">
-                Takes about a minute to install.
+                Takes a minute or two to install.
               </p>
             )}
             <button
@@ -3703,10 +3703,12 @@ export default function App() {
                     Your system Python is untouched.
                   </li>
                   <li>
-                    Point Claude Code at Headroom by setting <code>ANTHROPIC_BASE_URL</code> in your
-                    shell profile and <code>~/.claude/settings.json</code>. A timestamped backup is
-                    written before any edit. Token-saving add-ons like RTK are optional and installed
-                    separately.
+                    Point your installed coding CLIs at Headroom: Claude Code via{" "}
+                    <code>ANTHROPIC_BASE_URL</code> in your shell profile and{" "}
+                    <code>~/.claude/settings.json</code>, and Codex via <code>OPENAI_BASE_URL</code>{" "}
+                    and a managed provider block in <code>~/.codex/config.toml</code>. A timestamped
+                    backup is written before any edit. Token-saving add-ons like RTK are optional and
+                    installed separately.
                   </li>
                 </ul>
               </div>
