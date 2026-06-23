@@ -319,16 +319,19 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                         .into(),
                 );
             }
-            // RTK is a separate, user-toggleable integration (`set_rtk_enabled`
-            // tears it down without touching ANTHROPIC_BASE_URL routing). When
-            // the user has deliberately disabled RTK, its absence must not fail
-            // Claude Code verification — routing is what "connected" means here.
-            if !state.rtk_disabled && !rtk_path_ok {
+            // RTK is a separate, opt-in integration (`set_rtk_enabled` tears it
+            // down without touching ANTHROPIC_BASE_URL routing). Its wiring is
+            // only ever added when the managed binary exists on disk (see
+            // `ensure_rtk_integrations_for_targets`), so its absence must not
+            // fail Claude Code verification when RTK isn't installed or the user
+            // disabled it — routing is what "connected" means here.
+            let rtk_required = !state.rtk_disabled && default_headroom_rtk_path().exists();
+            if rtk_required && !rtk_path_ok {
                 failures.push(
                     "Headroom-managed RTK PATH export was not found in shell profiles.".into(),
                 );
             }
-            if !state.rtk_disabled && !rtk_hook_ok {
+            if rtk_required && !rtk_hook_ok {
                 failures.push(
                     "Headroom-managed RTK Claude hook was not found in ~/.claude/settings.json."
                         .into(),
@@ -4065,6 +4068,46 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             verification.failures.iter().all(|f| !f.contains("RTK")),
             "no RTK failures reported when RTK is disabled, got: {:?}",
+            verification.failures
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn verify_claude_code_passes_when_rtk_not_installed() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        fs::write(
+            home.path().join(".claude").join("settings.json"),
+            r#"{"hooks": {}}"#,
+        )
+        .unwrap();
+
+        // Clean install with RTK auto-install removed: routing is configured but
+        // the managed RTK binary was never dropped on disk and the user never
+        // toggled RTK off (rtk_disabled stays false). Claude Code must still
+        // verify green on routing alone.
+        super::apply_client_setup("claude_code").expect("apply_client_setup succeeds");
+
+        assert!(
+            !super::default_headroom_rtk_path().exists(),
+            "RTK binary must be absent for this test"
+        );
+        let state = super::load_setup_state();
+        assert!(!state.rtk_disabled, "rtk_disabled stays false when untoggled");
+
+        let verification =
+            super::verify_client_setup("claude_code").expect("verify_client_setup succeeds");
+        assert!(
+            verification.verified,
+            "claude_code verifies on routing alone when RTK isn't installed, failures: {:?}",
+            verification.failures
+        );
+        assert!(
+            verification.failures.iter().all(|f| !f.contains("RTK")),
+            "no RTK failures reported when RTK isn't installed, got: {:?}",
             verification.failures
         );
     }

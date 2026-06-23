@@ -45,7 +45,7 @@ export function TermsGate({ requiredVersion, termsUrl, onAccepted }: TermsGatePr
       <div className="terms-gate__panel">
         <img className="terms-gate__logo" src={headroomLogo} alt="" aria-hidden="true" />
         <h1 id="terms-gate-title" className="terms-gate__title">
-          We&apos;ve updated our Terms
+          Terms of Service
         </h1>
         <p className="terms-gate__copy">
           Please review and accept our Terms of Service to continue using

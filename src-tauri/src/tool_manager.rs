@@ -3508,6 +3508,7 @@ impl ToolManager {
     /// one host (Claude Code or Codex) still has the plugin registered, so a
     /// user who removes it via `/plugin` doesn't leave the card stuck on
     /// "Enabled".
+    #[cfg(test)]
     pub fn ponytail_installed(&self) -> bool {
         self.runtime.tools_dir.join("ponytail.json").exists()
             && PluginHost::ALL.iter().any(|host| host.plugin_present())

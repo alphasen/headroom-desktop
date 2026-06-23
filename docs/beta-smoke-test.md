@@ -28,9 +28,9 @@ Expect: mtime within the last minute. `lastTransformation` inside the file is a 
 
 ### 3. RTK is on PATH and reports savings (Claude Code only — RTK does not rewrite Codex)
 ```bash
-rtk --version && rtk gain | head -5
+zsh -lc 'rtk --version && rtk gain | head -5'
 ```
-Expect: a version line and a gain summary, no "command not found".
+Expect: a version line and a gain summary, no "command not found". The `zsh -lc` wrapper is required: `rtk` is added to PATH by the `headroom:managed_rtk` block in `~/.zprofile`, which only a login shell sources. Claude Code's Bash tool (and Codex's shell tool) spawn a non-login, non-interactive shell that does *not* source it, so a bare `rtk` here reports `command not found` on a perfectly healthy install. A login shell exercises the same PATH wiring a real terminal gets, so this confirms both that the managed block is intact and that the binary runs.
 
 ### 4. MCP retrieve tool is available (Claude Code only; only if memory tools are enabled)
 First check whether the proxy was started with memory tools:
@@ -162,6 +162,12 @@ When inspecting the running proxy by hand (e.g. checking `/stats`), wrap `curl` 
 
 ```bash
 rtk proxy curl -s http://127.0.0.1:6767/stats | jq .summary
+```
+
+Every `rtk` invocation in this doc (checks 3, 7, C2, and above) has the same PATH caveat as check 3: when Claude Code or Codex runs them through their shell tool, `rtk` is not on PATH because the non-login shell never sources `~/.zprofile`. Either wrap the command in `zsh -lc '...'`, or call the binary by its managed path:
+
+```bash
+"$HOME/Library/Application Support/Headroom/headroom/bin/rtk" proxy curl -s http://127.0.0.1:6767/stats | jq .summary
 ```
 
 ## When something fails

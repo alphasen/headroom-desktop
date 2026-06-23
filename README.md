@@ -66,8 +66,9 @@ If the proxy dies unexpectedly, a watchdog restarts it; after repeated failures 
 | Tool | What it does | Default |
 |------|-------------|---------|
 | [headroom](https://pypi.org/project/headroom-ai/) | Prompt optimization pipeline (Python) | Required |
-| [rtk](https://github.com/gglucass/rtk) | Rewrites Claude Code bash commands to strip noise before it reaches the context window | Auto-enabled |
-| vitals | Project health scanner — flags stale deps, large files, drift | Included |
+| [rtk](https://github.com/gglucass/rtk) | Rewrites Claude Code bash commands to strip noise before it reaches the context window | Opt-in add-on |
+| [markitdown](https://github.com/microsoft/markitdown) | Converts PDFs and Office documents to clean Markdown before the agent reads them | Opt-in add-on |
+| ponytail | Nudges the agent toward leaner, less over-engineered code | Opt-in add-on |
 
 **Tool inclusion policy:** only tools that run entirely locally, inside Headroom-managed storage, with a stable CLI surface make it in. No cloud dependencies, no host profile mutations. See [`research/tool-compatibility-matrix.md`](research/tool-compatibility-matrix.md).
 

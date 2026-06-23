@@ -227,7 +227,7 @@ const addonCopy: Record<string, AddonCopy> = {
 
 const connectorSetupDetails: Record<string, string> = {
   claude_code:
-    "Headroom injects ANTHROPIC_BASE_URL into shell profiles and ~/.claude/settings.json so Claude Code connects through Headroom. Headroom also installs RTK, adds it to your shell PATH, and enables Claude Code auto-rewrite for bash commands.",
+    "Headroom injects ANTHROPIC_BASE_URL into shell profiles and ~/.claude/settings.json so Claude Code connects through Headroom. Token-saving add-ons like RTK are optional: install them from the add-ons list and Headroom wires up the PATH entry and auto-rewrite hook only then.",
   codex:
     "Headroom writes a managed provider block to ~/.codex/config.toml and exports OPENAI_BASE_URL in your shell profiles so Codex connects through Headroom."
 };
@@ -988,7 +988,7 @@ export default function App() {
   });
   const [proxyVerificationRows, setProxyVerificationRows] = useState<ProxyVerificationRow[]>([]);
   const [proxyVerificationHint, setProxyVerificationHint] = useState<string | null>(null);
-  const proxyVerificationRequestAnchorRef = useRef<number | null>(null);
+  const proxyVerificationRequestAnchorRef = useRef<Record<string, number> | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
   const [resuming, setResuming] = useState(false);
   const [resumeError, setResumeError] = useState<string | null>(null);
@@ -1575,16 +1575,18 @@ export default function App() {
     const interval = window.setInterval(() => {
       void (async () => {
         try {
-          const [runtime, count] = await Promise.all([
+          const [runtime, counts] = await Promise.all([
             invoke<RuntimeStatus>("get_runtime_status"),
-            invoke<number | null>("get_headroom_request_count").catch(() => null)
+            invoke<Record<string, number> | null>(
+              "get_headroom_request_counts_by_agent"
+            ).catch(() => null)
           ]);
 
           if (!active) {
             return;
           }
 
-          if (!runtime.proxyReachable || count === null) {
+          if (!runtime.proxyReachable || counts === null) {
             setProxyVerificationHint(
               "Headroom proxy is not reachable yet. Start Headroom runtime, then send a test message."
             );
@@ -1597,20 +1599,26 @@ export default function App() {
           // null/unreachable reading would let a later "proxy came up" jump
           // (0 → N) look like new traffic.
           if (proxyVerificationRequestAnchorRef.current === null) {
-            proxyVerificationRequestAnchorRef.current = count;
+            proxyVerificationRequestAnchorRef.current = counts;
             return;
           }
 
-          if (count <= proxyVerificationRequestAnchorRef.current) {
-            return;
-          }
-
+          // Attribute traffic per client: a prompt sent to Claude Code must not
+          // flip the Codex row (and vice versa). The proxy keys agents as
+          // `claude-code` / `codex`; our rows use `claude_code` / `codex`.
+          const anchor = proxyVerificationRequestAnchorRef.current;
           setProxyVerificationRows((current) =>
-            current.map((row) =>
-              row.state === "verified"
-                ? row
-                : { ...row, state: "verified", message: "Request received" }
-            )
+            current.map((row) => {
+              if (row.state === "verified") {
+                return row;
+              }
+              const agentKey = row.clientId.replace(/_/g, "-");
+              const now = counts[agentKey] ?? 0;
+              const base = anchor[agentKey] ?? 0;
+              return now > base
+                ? { ...row, state: "verified", message: "Request received" }
+                : row;
+            })
           );
         } catch {
           if (active) {
@@ -3617,7 +3625,6 @@ export default function App() {
       >
         <h1>
           Headroom cuts Claude Code and Codex costs
-          <br />
            ~<span className="headline-highlight">50%</span> by trimming prompt bloat.
         </h1>
         <div className="intro-shell__checklist">
@@ -3696,9 +3703,10 @@ export default function App() {
                     Your system Python is untouched.
                   </li>
                   <li>
-                    Add a PreToolUse hook to <code>~/.claude/settings.json</code> and a script at{" "}
-                    <code>~/.claude/hooks/headroom-rtk-rewrite.sh</code> so Claude Code runs through
-                    Headroom. A timestamped backup is written before any edit.
+                    Point Claude Code at Headroom by setting <code>ANTHROPIC_BASE_URL</code> in your
+                    shell profile and <code>~/.claude/settings.json</code>. A timestamped backup is
+                    written before any edit. Token-saving add-ons like RTK are optional and installed
+                    separately.
                   </li>
                 </ul>
               </div>

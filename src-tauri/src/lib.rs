@@ -627,7 +627,7 @@ fn show_notification_impl(
 }
 
 #[tauri::command]
-fn install_addon(state: State<'_, AppState>, id: String) -> Result<DashboardState, String> {
+async fn install_addon(state: State<'_, AppState>, id: String) -> Result<DashboardState, String> {
     match id.as_str() {
         "markitdown" => {
             state
@@ -667,7 +667,7 @@ fn install_addon(state: State<'_, AppState>, id: String) -> Result<DashboardStat
 }
 
 #[tauri::command]
-fn set_addon_enabled(
+async fn set_addon_enabled(
     state: State<'_, AppState>,
     id: String,
     enabled: bool,
@@ -705,7 +705,7 @@ fn set_addon_enabled(
 }
 
 #[tauri::command]
-fn uninstall_addon(state: State<'_, AppState>, id: String) -> Result<DashboardState, String> {
+async fn uninstall_addon(state: State<'_, AppState>, id: String) -> Result<DashboardState, String> {
     match id.as_str() {
         "markitdown" => {
             let _ = client_adapters::disable_markitdown_integration(
@@ -1951,6 +1951,10 @@ fn get_headroom_request_count() -> Option<u64> {
 }
 
 fn fetch_proxy_request_count_stats() -> Option<u64> {
+    parse_request_count_from_stats_body(&fetch_proxy_stats_body()?)
+}
+
+fn fetch_proxy_stats_body() -> Option<String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_millis(500))
         .build()
@@ -1963,12 +1967,41 @@ fn fetch_proxy_request_count_stats() -> Option<u64> {
         if !response.status().is_success() {
             continue;
         }
-        let Ok(body) = response.text() else { continue };
-        if let Some(count) = parse_request_count_from_stats_body(&body) {
-            return Some(count);
+        if let Ok(body) = response.text() {
+            return Some(body);
         }
     }
     None
+}
+
+/// Per-agent request counts from `/stats` `agent_usage.agents[]`, keyed by the
+/// proxy's agent id (`claude-code`, `codex`, ...). Used by setup verification
+/// so a prompt sent to one client only flips that client's row, not all rows.
+#[tauri::command]
+fn get_headroom_request_counts_by_agent() -> Option<std::collections::HashMap<String, u64>> {
+    parse_request_counts_by_agent(&fetch_proxy_stats_body()?)
+}
+
+pub(crate) fn parse_request_counts_by_agent(
+    body: &str,
+) -> Option<std::collections::HashMap<String, u64>> {
+    let root = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let mut counts = std::collections::HashMap::new();
+    if let Some(agents) = root
+        .get("agent_usage")
+        .and_then(|v| v.get("agents"))
+        .and_then(|v| v.as_array())
+    {
+        for agent in agents {
+            if let (Some(key), Some(requests)) = (
+                agent.get("agent").and_then(|v| v.as_str()),
+                agent.get("requests").and_then(|v| v.as_u64()),
+            ) {
+                counts.insert(key.to_string(), requests);
+            }
+        }
+    }
+    Some(counts)
 }
 
 /// Pull `requests.total` (or any of the legacy spellings) out of a /stats
@@ -3278,6 +3311,7 @@ pub fn run() {
             get_runtime_status,
             get_headroom_logs,
             get_headroom_request_count,
+            get_headroom_request_counts_by_agent,
             get_rtk_activity,
             get_tool_logs,
             get_claude_code_projects,
@@ -5170,7 +5204,8 @@ mod tests {
         is_disk_full_signal, is_endpoint_protection_signal, is_network_download_signal,
         is_port_conflict_failure, is_prerelease_version, lifetime_token_milestone_kind,
         noop_app_update_progress_emitter, parse_live_learnings,
-        parse_request_count_from_stats_body, parse_updater_endpoint_list, pattern_matches_project,
+        parse_request_count_from_stats_body, parse_request_counts_by_agent,
+        parse_updater_endpoint_list, pattern_matches_project,
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
         resolve_release_updater_config, select_updater_endpoints, store_checked_update,
@@ -6532,6 +6567,29 @@ Some unrelated content.
         let body = json!({ "tokens": { "saved": 100 } }).to_string();
         assert_eq!(parse_request_count_from_stats_body(&body), None);
         assert_eq!(parse_request_count_from_stats_body("not json"), None);
+    }
+
+    #[test]
+    fn parse_request_counts_by_agent_keys_by_agent_id() {
+        let body = json!({
+            "agent_usage": {
+                "agents": [
+                    { "agent": "claude-code", "requests": 5 },
+                    { "agent": "codex", "requests": 2 }
+                ]
+            }
+        })
+        .to_string();
+        let counts = parse_request_counts_by_agent(&body).unwrap();
+        assert_eq!(counts.get("claude-code"), Some(&5));
+        assert_eq!(counts.get("codex"), Some(&2));
+
+        // Proxy up, no traffic yet: empty map, not None.
+        let empty = json!({ "agent_usage": { "agents": [] } }).to_string();
+        assert!(parse_request_counts_by_agent(&empty).unwrap().is_empty());
+
+        // Unparseable body is None so the poller treats it as unreachable.
+        assert!(parse_request_counts_by_agent("not json").is_none());
     }
 
     #[test]
