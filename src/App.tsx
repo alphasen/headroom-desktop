@@ -980,13 +980,6 @@ export default function App() {
   const [connectorsBusy, setConnectorsBusy] = useState(false);
   const [connectorPhase, setConnectorPhase] = useState<"disabled" | "verifying" | "healthy">("healthy");
   const [connectorsError, setConnectorsError] = useState<string | null>(null);
-  const [codexNudgeDismissed, setCodexNudgeDismissed] = useState(() => {
-    try {
-      return window.localStorage.getItem("headroom:codexNudgeDismissed") === "1";
-    } catch {
-      return false;
-    }
-  });
   const [proxyVerificationRows, setProxyVerificationRows] = useState<ProxyVerificationRow[]>([]);
   const [proxyVerificationHint, setProxyVerificationHint] = useState<string | null>(null);
   const proxyVerificationRequestAnchorRef = useRef<Record<string, number> | null>(null);
@@ -3200,16 +3193,6 @@ export default function App() {
   }
 
 
-  function dismissCodexNudge() {
-    setCodexNudgeDismissed(true);
-    try {
-      window.localStorage.setItem("headroom:codexNudgeDismissed", "1");
-    } catch {
-      // localStorage unavailable (private mode); the nudge stays dismissed for
-      // this session via state, which is good enough.
-    }
-  }
-
   function handleLauncherSurfaceMouseDown(event: MouseEvent<HTMLElement>) {
     if (event.button !== 0) {
       return;
@@ -4674,48 +4657,6 @@ export default function App() {
                 );
               })()}
             </section>
-
-            {(() => {
-              const codexConnector = aggregateClientConnectors(connectors).find(
-                (connector) => connector.clientId === "codex"
-              );
-              const showCodexNudge =
-                !codexNudgeDismissed &&
-                !!codexConnector &&
-                codexConnector.installed &&
-                !codexConnector.enabled &&
-                pricingStatus?.optimizationAllowed !== false;
-              if (!showCodexNudge || !codexConnector) {
-                return null;
-              }
-              return (
-                <section className="connector-nudge" aria-label="Codex now supported">
-                  <div className="connector-nudge__body">
-                    <p className="connector-nudge__title">Headroom now supports Codex</p>
-                    <p className="connector-nudge__message">
-                      Route Codex through Headroom to trim its token costs too, the same way it
-                      already does for Claude Code.
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    className="connector-nudge__action"
-                    disabled={connectorsBusy}
-                    onClick={() => void toggleConnector(codexConnector, true)}
-                  >
-                    Turn on Codex
-                  </button>
-                  <button
-                    type="button"
-                    className="connector-nudge__dismiss"
-                    aria-label="Dismiss Codex suggestion"
-                    onClick={dismissCodexNudge}
-                  >
-                    Dismiss
-                  </button>
-                </section>
-              );
-            })()}
 
             <section className="stat-grid stat-grid--2col">
               <article
