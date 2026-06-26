@@ -788,9 +788,13 @@ impl ToolManager {
                 // Wrap with `nice` so headroom yields CPU to foreground apps
                 // (Claude Code, terminal, etc.) when the machine is contended.
                 // On idle systems headroom still runs at full speed.
+                // +2 (not +5): under sustained contention from many concurrent
+                // agents a too-niced backend gets starved enough that even the
+                // watchdog's tolerant 5s re-probe misses, triggering spurious
+                // auto-pause. +2 still yields, without the starvation.
                 let mut child = Command::new("/usr/bin/nice")
                     .arg("-n")
-                    .arg("5")
+                    .arg("2")
                     .arg(executable)
                     .args(args)
                     .current_dir(&self.runtime.root_dir)

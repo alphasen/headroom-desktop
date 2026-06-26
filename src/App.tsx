@@ -915,6 +915,14 @@ function AddonCard({
   );
 }
 
+function buildAddonRequestMailto(): string {
+  const subject = "Addon request";
+  const body =
+    "Which addon would you like to see in Headroom?\n\n\n" +
+    "What would it do for you / which tool does it wrap?\n\n\n";
+  return `mailto:product@extraheadroom.com?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+}
+
 function buildUpgradeIssueMailto(failure: RuntimeUpgradeFailure): string {
   const subject = `Headroom update issue (${failure.targetHeadroomVersion}, ${failure.failurePhase})`;
   const diagnosticLines = [
@@ -5210,6 +5218,16 @@ export default function App() {
                   );
                 })}
             </ul>
+            <div className="addons__request">
+              <span className="addons__request-text">Missing an addon you want?</span>
+              <button
+                type="button"
+                className="addon-card__link"
+                onClick={() => void openExternalLink(buildAddonRequestMailto())}
+              >
+                Request an addon
+              </button>
+            </div>
           </section>
         </div>
 

@@ -529,7 +529,32 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     );
     status.codex = fetch_codex_usage(state, status.account.as_ref());
     maybe_apply_fake_weekly_gate(&mut status);
+    // Attach the signed-in account to the Sentry scope so later captures from
+    // anywhere in the process (notably the proxy watchdog's auto-pause event)
+    // carry the user's email and tier — without this, support can't map a crash
+    // to the customer who reported it. Global scope: persists until overwritten.
+    set_sentry_user(status.account.as_ref());
     Ok(status)
+}
+
+/// Set (or clear) the Sentry user scope from the Headroom account. Email is the
+/// support-triage key; tier is added as a tag so issues can be filtered by plan.
+fn set_sentry_user(account: Option<&HeadroomAccountProfile>) {
+    sentry::configure_scope(|scope| match account {
+        Some(acc) => {
+            scope.set_user(Some(sentry::User {
+                email: Some(acc.email.clone()),
+                ..Default::default()
+            }));
+            scope.set_tag(
+                "headroom.tier",
+                acc.subscription_tier
+                    .map(|t| format!("{t:?}"))
+                    .unwrap_or_else(|| "none".into()),
+            );
+        }
+        None => scope.set_user(None),
+    });
 }
 
 /// Debug-only: force the weekly-limit nudge or gate so the savings-counterfactual

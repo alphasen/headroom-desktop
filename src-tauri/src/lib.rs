@@ -678,7 +678,6 @@ async fn install_addon(
                 &state.tool_manager.managed_python(),
             )
             .map_err(|err| format!("markitdown installed but enabling integration failed: {err:#}"))?;
-            Ok(state.dashboard())
         }
         "rtk" => {
             state
@@ -691,7 +690,6 @@ async fn install_addon(
                 &state.tool_manager.managed_python(),
             )
             .map_err(|err| format!("rtk installed but enabling integration failed: {err:#}"))?;
-            Ok(state.dashboard())
         }
         "ponytail" => {
             let codex_outdated = state
@@ -706,14 +704,16 @@ async fn install_addon(
                     None,
                 );
             }
-            Ok(state.dashboard())
         }
-        other => Err(format!("unknown addon: {other}")),
+        other => return Err(format!("unknown addon: {other}")),
     }
+    analytics::track_event(&app, &format!("{id}_installed"), None);
+    Ok(state.dashboard())
 }
 
 #[tauri::command]
 async fn set_addon_enabled(
+    app: AppHandle,
     state: State<'_, AppState>,
     id: String,
     enabled: bool,
@@ -737,21 +737,26 @@ async fn set_addon_enabled(
                 )
                 .map_err(|err| err.to_string())?;
             }
-            Ok(state.dashboard())
         }
         "ponytail" => {
             state
                 .tool_manager
                 .set_ponytail_enabled(enabled)
                 .map_err(|err| err.to_string())?;
-            Ok(state.dashboard())
         }
-        other => Err(format!("unknown addon: {other}")),
+        other => return Err(format!("unknown addon: {other}")),
     }
+    let action = if enabled { "enabled" } else { "disabled" };
+    analytics::track_event(&app, &format!("{id}_{action}"), None);
+    Ok(state.dashboard())
 }
 
 #[tauri::command]
-async fn uninstall_addon(state: State<'_, AppState>, id: String) -> Result<DashboardState, String> {
+async fn uninstall_addon(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<DashboardState, String> {
     match id.as_str() {
         "markitdown" => {
             let _ = client_adapters::disable_markitdown_integration(
@@ -761,7 +766,6 @@ async fn uninstall_addon(state: State<'_, AppState>, id: String) -> Result<Dashb
                 .tool_manager
                 .uninstall_markitdown()
                 .map_err(|err| err.to_string())?;
-            Ok(state.dashboard())
         }
         "rtk" => {
             client_adapters::set_rtk_enabled(
@@ -774,17 +778,17 @@ async fn uninstall_addon(state: State<'_, AppState>, id: String) -> Result<Dashb
                 .tool_manager
                 .uninstall_rtk()
                 .map_err(|err| err.to_string())?;
-            Ok(state.dashboard())
         }
         "ponytail" => {
             state
                 .tool_manager
                 .uninstall_ponytail()
                 .map_err(|err| err.to_string())?;
-            Ok(state.dashboard())
         }
-        other => Err(format!("unknown addon: {other}")),
+        other => return Err(format!("unknown addon: {other}")),
     }
+    analytics::track_event(&app, &format!("{id}_uninstalled"), None);
+    Ok(state.dashboard())
 }
 
 #[tauri::command]
@@ -3020,6 +3024,8 @@ async fn set_rtk_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> 
     )
     .map_err(|err| err.to_string())?;
     state.invalidate_runtime_status_cache();
+    let action = if enabled { "enabled" } else { "disabled" };
+    analytics::track_event(&app, &format!("rtk_{action}"), None);
     Ok(!client_adapters::is_rtk_disabled())
 }
 
@@ -4554,7 +4560,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             // Tolerant confirmation before counting a strike. The standard
             // reachability check (`is_headroom_proxy_reachable`) uses a tight
             // 1.5s timeout via the 6767 intercept; the backend runs niced
-            // (`nice -n 5`), so under heavy compression/embedding load a
+            // (`nice -n 2`), so under heavy compression/embedding load a
             // perfectly healthy proxy can miss that window. Re-probe the
             // backend's /readyz directly with a 5s budget — if it answers, the
             // process is alive and merely busy, so don't count it as down.

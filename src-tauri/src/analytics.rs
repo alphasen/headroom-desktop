@@ -13,6 +13,35 @@ use serde_json::{json, Map, Value};
 use tauri::{webview_version, AppHandle, Manager};
 
 const HEADROOM_APTABASE_APP_KEY: Option<&str> = option_env!("HEADROOM_APTABASE_APP_KEY");
+
+// Allowlist to stay under the Aptabase free-plan event quota. Only version
+// visibility (app_started carries appVersion/headroom_ai_version), the billing
+// funnel, and the savings milestone are worth ingesting. Everything else
+// (runtime lifecycle, bootstrap, errors, misc UI) is dropped at the chokepoint.
+// ponytail: allowlist over deleting 30 call sites; widen this set if a dropped
+// event becomes worth tracking again.
+const ALLOWED_EVENTS: &[&str] = &[
+    "app_started",
+    "account_activated",
+    "checkout_started",
+    "subscription_plan_changed",
+    "subscription_reactivated",
+    "invite_code_used",
+    "lifetime_tokens_saved_milestone_reached",
+    // Addon adoption (one event per addon, fired from install/enable/uninstall).
+    "markitdown_installed",
+    "markitdown_enabled",
+    "markitdown_disabled",
+    "markitdown_uninstalled",
+    "rtk_installed",
+    "rtk_enabled",
+    "rtk_disabled",
+    "rtk_uninstalled",
+    "ponytail_installed",
+    "ponytail_enabled",
+    "ponytail_disabled",
+    "ponytail_uninstalled",
+];
 const SESSION_TIMEOUT_SECS: i64 = 4 * 60 * 60;
 const HTTP_REQUEST_TIMEOUT_SECS: u64 = 10;
 #[cfg(debug_assertions)]
@@ -89,6 +118,9 @@ impl AnalyticsClient {
 
         let normalized_name = normalize_event_name(name);
         if normalized_name.is_empty() {
+            return Ok(());
+        }
+        if !ALLOWED_EVENTS.contains(&normalized_name.as_str()) {
             return Ok(());
         }
 
@@ -423,7 +455,7 @@ fn new_session_id() -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{new_session_id, sanitize_properties, AnalyticsConfig};
+    use super::{new_session_id, sanitize_properties, AnalyticsConfig, ALLOWED_EVENTS};
 
     #[test]
     fn sanitize_properties_keeps_supported_values() {
@@ -462,6 +494,14 @@ mod tests {
             "https://eu.aptabase.com/api/v0/events"
         );
         std::env::remove_var("HEADROOM_APTABASE_APP_KEY");
+    }
+
+    #[test]
+    fn allowlist_keeps_version_and_billing_drops_noise() {
+        assert!(ALLOWED_EVENTS.contains(&"app_started"));
+        assert!(ALLOWED_EVENTS.contains(&"account_activated"));
+        assert!(!ALLOWED_EVENTS.contains(&"runtime_paused"));
+        assert!(!ALLOWED_EVENTS.contains(&"bootstrap_skipped"));
     }
 
     #[test]

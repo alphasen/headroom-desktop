@@ -5337,7 +5337,13 @@ fn parse_f64_from_text(text: &str) -> Option<f64> {
 }
 
 pub(crate) fn headroom_proxy_reachable() -> bool {
-    is_headroom_proxy_reachable()
+    // Status/UI boundary: tolerant by design. The tight 1.5s probe flaps red
+    // under load when the niced backend is busy with compression/embedding,
+    // even though traffic still flows ("red light, works"). Use a 5s ceiling
+    // matching the watchdog's tolerance — a healthy /readyz still answers in
+    // milliseconds, so the dot stays responsive; the larger budget only bites
+    // when the backend is genuinely slow.
+    probe_proxy_readyz(Duration::from_secs(5))
 }
 
 /// Turn a raw `last_startup_error` string (the anyhow chain from
@@ -5391,10 +5397,11 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
 }
 
 fn is_headroom_proxy_reachable() -> bool {
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(1500))
-        .build()
-    {
+    probe_proxy_readyz(Duration::from_millis(1500))
+}
+
+fn probe_proxy_readyz(timeout: Duration) -> bool {
+    let client = match reqwest::blocking::Client::builder().timeout(timeout).build() {
         Ok(client) => client,
         Err(_) => return false,
     };
