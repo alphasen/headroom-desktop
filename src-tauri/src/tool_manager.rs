@@ -856,6 +856,18 @@ impl ToolManager {
                     // were removed; cache mode contributed no measurable savings over
                     // Claude Code's native prefix caching.)
                     .env("HEADROOM_MODE", "token")
+                    // Pin per-request auth-mode policy enforcement ON. This is what
+                    // keeps OAuth/subscription traffic (Claude Code, classified
+                    // SUBSCRIPTION by User-Agent) on the conservative
+                    // live-zone-only + cache-aligner-off policy so prior-turn
+                    // compression never rewrites the frozen, already-cached prefix
+                    // and busts Anthropic's prefix cache. Upstream defaults this to
+                    // "enabled", but we set it explicitly so a future headroom-ai
+                    // bump can't silently flip the default and fall subscription
+                    // traffic back to the PAYG-aggressive policy (resolve_policy()
+                    // returns policy_default_payg() when enforcement is off) -- a
+                    // net loss on cache-billed subscription sessions.
+                    .env("HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT", "enabled")
                     // Enable plain user-message text compression in addition to
                     // tool results. Primary motive is Codex/OpenAI: with a 0.5
                     // read-discount and 0.0 write-penalty, compressing user text

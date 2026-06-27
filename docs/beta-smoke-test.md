@@ -46,25 +46,26 @@ Click the tray icon, open the dashboard. Expect savings chart and per-client sta
 In Settings, toggle Pause then Resume. After Pause, `cat ~/.claude/settings.json | grep -c headroom-rtk-rewrite` should return `0`; after Resume it should return `1`. This verifies the Claude Code config only — Pause clears *all* clients, so check C4 in the Codex pass confirms Codex's config is stripped and restored too.
 
 ### 7. Proxy is actively optimizing this conversation (not just a heartbeat)
-First check which mode the proxy is in — the right signal differs:
-```bash
-rtk proxy curl -s http://127.0.0.1:6767/stats | jq -r '.summary.mode'
-```
-A Claude Code subscription/OAuth session (the normal desktop case) reports `cache`. The proxy deliberately stays in cache mode for this traffic because it's billed on the cache-weighted meter, where token mode's prefix rewrites bust the cache and inflate usage — so `requests_compressed` will *never* move here (see the `HEADROOM_MODE` comment in `tool_manager.rs`). The intercept only flips to `token` mode for pay-per-token API-key traffic. Pick the matching sub-check.
+The proxy always runs in `token` mode now (`HEADROOM_MODE=token`, hardcoded — cache mode and the old auth-based mode auto-switch were removed; see `tool_manager.rs`). So `.summary.mode` reports `token` for *every* session, including a Claude Code subscription/OAuth one — don't branch on it. What actually differs per request is the **compression policy**, chosen by the auth-mode classifier (`classify_auth_mode` in the proxy) from the client `User-Agent`:
+
+- **Claude Code subscription/OAuth** (UA `claude-code/`, the normal desktop case) is classified `SUBSCRIPTION` → conservative policy (`live_zone_only=True`, cache-aligner off). The proxy only compresses the **uncached live zone** and freezes the already-cached prefix, so `prefix_frozen` moves while the *cumulative* compression counters move only modestly. The right liveness signal here is `prefix_frozen` + `cache_savings_usd`.
+- **Pay-per-token API-key / Codex traffic** is classified `PAYG`/`OAUTH` → aggressive policy, so `requests_compressed` and `total_tokens_removed` move directly.
+
+This policy gate is itself guarded by `HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT=enabled` (pinned explicitly in `tool_manager.rs`). If that ever reads disabled, subscription traffic silently falls back to the PAYG-aggressive policy and starts busting the prefix cache — a net loss on cache-billed sessions. Pick the sub-check matching the traffic you're driving.
 
 Timing matters either way: a `Read` result becomes part of Claude's *next* outgoing prompt, not the one currently being composed. So the baseline capture, the large Read, and the re-check cannot all happen in one turn — the re-check will still show the old numbers.
 
-**If mode is `cache`** (normal desktop / Claude Code subscription):
+**Claude Code subscription/OAuth traffic** (UA `claude-code/`, classified `SUBSCRIPTION`):
 1. Capture the baseline:
    ```bash
-   rtk proxy curl -s http://127.0.0.1:6767/stats | jq '{prefix_frozen: .summary.uncompressed_requests.prefix_frozen, cache_savings_usd: .summary.cost.breakdown.cache_savings_usd, total_tokens_before: .summary.compression.total_tokens_before_with_cli_filtering}'
+   rtk proxy curl -s http://127.0.0.1:6767/stats | jq '{primary_model: .summary.primary_model, prefix_frozen: .summary.uncompressed_requests.prefix_frozen, cache_savings_usd: .summary.cost.breakdown.cache_savings_usd, total_tokens_before: .summary.compression.total_tokens_before_with_cli_filtering}'
    ```
 2. End the turn with a large Read in flight — e.g. ask Claude to read a long file like `src-tauri/src/lib.rs` with as large an offset/limit window as the Read tool allows (the 25k-token cap means you cannot read it whole; ~1300-1500 lines is plenty).
 3. On the *next* turn, re-run the same `jq` command.
 
-Expect: `cache_savings_usd` is strictly greater, `prefix_frozen` increased by at least 1, and `total_tokens_before` jumped by roughly the size of the Read. A bumped mtime on `activity-facts.json` is not enough — interception alone would still touch that file without delivering cache savings.
+Expect: `primary_model` is a `claude-*` model, `prefix_frozen` increased by at least 1 (the cached prefix was preserved, not rewritten), `cache_savings_usd` is strictly greater, and `total_tokens_before` jumped by roughly the size of the Read. A bumped mtime on `activity-facts.json` is not enough — interception alone would still touch that file without delivering savings. `requests_compressed` may or may not move here and is *not* the signal for subscription traffic.
 
-**If mode is `token`** (pay-per-token API-key traffic — this is also the branch Codex hits; the Codex pass below adds a Codex-attributed version):
+**Pay-per-token API-key traffic** (classified `PAYG`/`OAUTH` — this is also the branch Codex hits; the Codex pass below adds a Codex-attributed version):
 1. Capture the baseline:
    ```bash
    rtk proxy curl -s http://127.0.0.1:6767/stats | jq '.summary.compression.requests_compressed, .summary.compression.total_tokens_removed'
