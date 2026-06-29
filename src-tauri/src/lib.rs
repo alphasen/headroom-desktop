@@ -5066,6 +5066,24 @@ fn ensure_runtime_ready_for_tray(app: &AppHandle) {
     match state.ensure_headroom_running() {
         Ok(()) => port_conflict::note_proxy_started(app),
         Err(err) => {
+            // The managed runtime can disappear out from under a running app
+            // (disk cleanup, AV quarantine, a wiped Application Support dir), or
+            // race away between the onboarding_complete gate and this call. In
+            // that case ensure_headroom_running bails "managed python not found"
+            // -- a recoverable not-installed state, not a startup crash, so
+            // capturing it as one produced misleading Sentry noise (RUST-1M).
+            // Route back to the setup window, which re-runs bootstrap to restore
+            // the runtime, instead of treating it as a failed start.
+            if !state.tool_manager.python_runtime_installed() {
+                log::warn!(
+                    "ensure_runtime_ready_for_tray: managed runtime missing; routing to setup: {err:#}"
+                );
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+                let _ = show_launcher_window(app);
+                return;
+            }
             // Tray open is in-session (not a fresh launch); pass false so the
             // launch counter is preserved instead of double-counting clicks.
             let handled = port_conflict::note_proxy_failed(app, &err, false);
