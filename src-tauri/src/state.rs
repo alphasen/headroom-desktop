@@ -5424,9 +5424,20 @@ fn probe_proxy_readyz(timeout: Duration) -> bool {
         client
             .get(format!("http://{host}:6767/readyz"))
             .send()
-            .map(|response| response.status().is_success())
+            .map(|response| proxy_readyz_status_is_reachable(response.status()))
             .unwrap_or(false)
     })
+}
+
+/// Whether a `/readyz` HTTP status means the proxy is up and serving.
+///
+/// 2xx is ready. A 404 means an older proxy build that predates the `/readyz`
+/// route is answering -- it's up and serving traffic, just lacks the endpoint,
+/// so it must count as reachable or the watchdog auto-pauses a working proxy
+/// (Sentry RUST-2X). A 503 (current proxy up but not ready) and any 5xx stay
+/// not-reachable so the watchdog keeps waiting / restarting as before.
+fn proxy_readyz_status_is_reachable(status: reqwest::StatusCode) -> bool {
+    status.is_success() || status == reqwest::StatusCode::NOT_FOUND
 }
 
 fn kill_processes_by_command_pattern(pattern: &str) -> Result<()> {
@@ -5622,10 +5633,26 @@ mod tests {
         lifetime_token_milestones_crossed, lifetime_usd_milestones_crossed, log_mtime_advanced,
         merge_daily_savings, merge_hourly_savings, most_recent_monday,
         parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
-        tcp_port_accepts_connection, total_dir_size_bytes, AppState, BootValidationOutcome,
+        proxy_readyz_status_is_reachable, tcp_port_accepts_connection, total_dir_size_bytes,
+        AppState, BootValidationOutcome,
         ClaudeProjectScan, DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
         PersistedSavingsState, SavingsObservation, SavingsTracker,
     };
+
+    #[test]
+    fn readyz_404_counts_as_reachable_but_503_does_not() {
+        use reqwest::StatusCode;
+        assert!(proxy_readyz_status_is_reachable(StatusCode::OK));
+        // Old proxy without the /readyz route, still serving (RUST-2X).
+        assert!(proxy_readyz_status_is_reachable(StatusCode::NOT_FOUND));
+        // Up but not ready / errored: keep waiting, count as unreachable.
+        assert!(!proxy_readyz_status_is_reachable(
+            StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(!proxy_readyz_status_is_reachable(
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
+    }
 
     #[test]
     fn boot_validation_stalled_within_grace_window_is_never_stalled() {

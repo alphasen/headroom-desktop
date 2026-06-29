@@ -211,6 +211,21 @@ const SPEND_SCHEMA_CUTOFF_DATE: &str = "2026-04-13";
 // was compressed -- which implies tokens were sent and a cost incurred. Zero
 // spend against it is the genuine pipeline anomaly.
 fn zero_spend_affected_days(daily_savings: &[DailySavingsPoint]) -> Vec<&str> {
+    // Only meaningful when the proxy actually reports spend. `total_tokens_sent`
+    // and `actual_cost_usd` come from Option fields on /stats; a proxy build
+    // that omits them lands every day at 0, indistinguishable from a real
+    // "reported zero" (Sentry RUST-3S/3V). A compressed request always sends
+    // tokens, so on a reporting proxy compression savings never coincide with
+    // zero reported spend -- meaning if no day in the window reports any spend,
+    // the user is simply on a non-reporting proxy and every zero is a reporting
+    // gap, not an anomaly. Native-rollup ingestion overwrites settled days with
+    // authoritative backend spend, so this self-heals once they upgrade.
+    let proxy_reports_spend = daily_savings
+        .iter()
+        .any(|p| p.total_tokens_sent > 0 || p.actual_cost_usd > 0.0);
+    if !proxy_reports_spend {
+        return Vec::new();
+    }
     daily_savings
         .iter()
         .filter(|p| {
@@ -5345,9 +5360,24 @@ mod tests {
 
     #[test]
     fn zero_spend_flags_compression_savings_with_no_spend() {
-        // Compression dollars recorded but the spend pipeline reported nothing.
-        let days = vec![daily_point("2026-06-16", 0.12, 5_000, 0.0, 0)];
+        // On a spend-reporting proxy (the 06-15 day proves it reports), a separate
+        // compression-savings day that recorded zero spend is the genuine anomaly.
+        let days = vec![
+            daily_point("2026-06-15", 0.20, 9_000, 0.50, 12_000),
+            daily_point("2026-06-16", 0.12, 5_000, 0.0, 0),
+        ];
         assert_eq!(zero_spend_affected_days(&days), vec!["2026-06-16"]);
+    }
+
+    #[test]
+    fn zero_spend_suppressed_when_proxy_never_reports_spend() {
+        // Old proxy that omits spend fields: every day lands at zero spend, so a
+        // compression-savings day is a reporting gap, not an anomaly (RUST-3S/3V).
+        let days = vec![
+            daily_point("2026-06-15", 0.20, 9_000, 0.0, 0),
+            daily_point("2026-06-16", 0.12, 5_000, 0.0, 0),
+        ];
+        assert!(zero_spend_affected_days(&days).is_empty());
     }
 
     #[test]
@@ -5358,8 +5388,12 @@ mod tests {
 
     #[test]
     fn zero_spend_ignores_pre_schema_cutoff_days() {
-        // Pre-v6 records deserialize spend fields as 0; never flag them.
-        let days = vec![daily_point("2026-04-12", 0.12, 5_000, 0.0, 0)];
+        // Pre-v6 records deserialize spend fields as 0; never flag them even when
+        // the proxy otherwise reports spend (the 06-16 day).
+        let days = vec![
+            daily_point("2026-06-16", 0.20, 9_000, 0.50, 12_000),
+            daily_point("2026-04-12", 0.12, 5_000, 0.0, 0),
+        ];
         assert!(zero_spend_affected_days(&days).is_empty());
     }
 

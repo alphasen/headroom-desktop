@@ -1269,13 +1269,49 @@ impl ToolManager {
         std::fs::create_dir_all(&logs_dir)
             .with_context(|| format!("creating {}", logs_dir.display()))?;
         let log_path = logs_dir.join("kompress-prefetch.log");
+
+        // hf_hub_download resumes from its `.incomplete` blob via range
+        // requests, so re-invoking the subprocess continues a partial pull
+        // rather than restarting it. Retry only network-category failures
+        // (RUST-3C): a dropped connection or TLS blip on the ~315MB model is
+        // exactly what a second attempt fixes; permission/other failures won't
+        // improve on retry. ponytail: 3 attempts, linear backoff -- raise only
+        // if telemetry shows partials still not converging within a launch.
+        const MAX_ATTEMPTS: u32 = 3;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.run_kompress_prefetch_once(&python, &log_path)? {
+                KompressPrefetchOutcome::Downloaded => {
+                    return Ok(KompressPrefetchOutcome::Downloaded);
+                }
+                KompressPrefetchOutcome::Failed { cause } => {
+                    if !cause.starts_with("[network]") || attempt == MAX_ATTEMPTS {
+                        return Ok(KompressPrefetchOutcome::Failed { cause });
+                    }
+                    log::warn!(
+                        "kompress prefetch attempt {attempt}/{MAX_ATTEMPTS} failed (retrying): {cause}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(3 * attempt as u64));
+                }
+            }
+        }
+        unreachable!("kompress prefetch loop returns on the final attempt")
+    }
+
+    /// Runs a single kompress preload subprocess, appending its output to
+    /// `kompress-prefetch.log`. Retry/backoff across network failures lives in
+    /// the caller, [`Self::prefetch_kompress_model`].
+    fn run_kompress_prefetch_once(
+        &self,
+        python: &Path,
+        log_path: &Path,
+    ) -> Result<KompressPrefetchOutcome> {
         let log_file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&log_path)
+            .open(log_path)
             .with_context(|| format!("opening {}", log_path.display()))?;
 
-        let status = Command::new(&python)
+        let status = Command::new(python)
             .arg("-c")
             .arg(
                 "from headroom.transforms.kompress_compressor import KompressCompressor; \
@@ -1307,7 +1343,7 @@ impl ToolManager {
             Ok(KompressPrefetchOutcome::Downloaded)
         } else {
             Ok(KompressPrefetchOutcome::Failed {
-                cause: summarize_kompress_prefetch_failure(&log_path),
+                cause: summarize_kompress_prefetch_failure(log_path),
             })
         }
     }

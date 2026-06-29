@@ -2419,7 +2419,12 @@ fn is_headroom_proxy_reachable() -> bool {
         client
             .get(format!("http://{host}:6767/readyz"))
             .send()
-            .map(|response| response.status().is_success())
+            // 404 = an older proxy build without the /readyz route, still up and
+            // serving -- count it as reachable (Sentry RUST-2X).
+            .map(|response| {
+                let status = response.status();
+                status.is_success() || status == reqwest::StatusCode::NOT_FOUND
+            })
             .unwrap_or(false)
     })
 }
