@@ -491,6 +491,13 @@ pub struct AppState {
     /// a single bad pricing read (network blip, brief utilization spike) from
     /// flipping the gate off and back on within minutes.
     pricing_gate_violation_streak: Arc<AtomicU32>,
+    /// Per-session rising-edge latches so the weekly-limit nudge is reported to
+    /// the server at most once per condition while it holds, instead of on every
+    /// 60s pricing poll. They reset to `false` on any non-gated poll and on app
+    /// restart; the server throttles to ~one email per weekly window, so a
+    /// re-report after restart is harmless.
+    weekly_limit_reached_reported: Arc<AtomicBool>,
+    weekly_limit_approaching_reported: Arc<AtomicBool>,
     launch_profile: Mutex<LaunchProfile>,
     launch_profile_path: std::path::PathBuf,
     last_known_good_plan: Mutex<Option<LastKnownGoodPlan>>,
@@ -624,6 +631,8 @@ impl AppState {
             codex_bypass: Arc::new(AtomicBool::new(false)),
             codex_gate_violation_streak: Arc::new(AtomicU32::new(0)),
             pricing_gate_violation_streak: Arc::new(AtomicU32::new(0)),
+            weekly_limit_reached_reported: Arc::new(AtomicBool::new(false)),
+            weekly_limit_approaching_reported: Arc::new(AtomicBool::new(false)),
             headroom_learn_state: Mutex::new(HeadroomLearnRuntimeState {
                 running: false,
                 project_path: None,
@@ -3094,6 +3103,30 @@ impl AppState {
             self.pricing_gate_violation_streak.store(0, Release);
             if was_bypassed {
                 self.exit_claude_gate();
+            }
+        }
+    }
+
+    /// Fire-and-forget weekly-limit reporting to headroom-web on the rising edge
+    /// of each condition. The server emails free-plan users, ignores subscribers,
+    /// and throttles to ~one per weekly window; the per-session latches here just
+    /// avoid re-posting on every 60s poll while the condition holds.
+    pub fn report_weekly_limit_transitions(&self, status: &crate::models::HeadroomPricingStatus) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match crate::pricing::weekly_limit_signal(status) {
+            Some("reached") => {
+                if !self.weekly_limit_reached_reported.swap(true, Relaxed) {
+                    crate::pricing::report_weekly_limit("reached");
+                }
+            }
+            Some("approaching") => {
+                if !self.weekly_limit_approaching_reported.swap(true, Relaxed) {
+                    crate::pricing::report_weekly_limit("approaching");
+                }
+            }
+            _ => {
+                self.weekly_limit_reached_reported.store(false, Relaxed);
+                self.weekly_limit_approaching_reported.store(false, Relaxed);
             }
         }
     }

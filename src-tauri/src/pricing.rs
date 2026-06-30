@@ -968,6 +968,56 @@ pub fn report_milestone(milestone_tokens_saved: u64) {
         .send();
 }
 
+/// Maps a freshly evaluated pricing status to the weekly-limit nudge the
+/// desktop should report, or `None`. `"reached"` when the weekly cap has paused
+/// optimization (Claude or Codex); `"approaching"` when nudging near it but not
+/// yet paused. Subscriber filtering and per-window de-duplication are the
+/// server's job (headroom-web `POST /api/v1/desktop/weekly_limit`), so this
+/// stays a pure mapping.
+pub fn weekly_limit_signal(status: &HeadroomPricingStatus) -> Option<&'static str> {
+    let claude_reached = !status.optimization_allowed
+        && matches!(
+            status.gate_reason,
+            Some(PricingGateReason::WeeklyUsageLimitReached)
+        );
+    let codex_reached = status
+        .codex
+        .as_ref()
+        .is_some_and(|codex| !codex.optimization_allowed);
+    if claude_reached || codex_reached {
+        return Some("reached");
+    }
+
+    let approaching = status.should_nudge
+        || status
+            .codex
+            .as_ref()
+            .is_some_and(|codex| codex.should_nudge);
+    approaching.then_some("approaching")
+}
+
+/// Fire-and-forget: reports a weekly-limit nudge event ("approaching" or
+/// "reached") so the server can email free-plan users. Mirrors
+/// `report_milestone`: no-ops if the user is not signed in or the request fails.
+pub fn report_weekly_limit(status: &str) {
+    let token = match read_session_token() {
+        Ok(Some(t)) => t,
+        _ => return,
+    };
+    let client = match http_client() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let identity = IdentityPayload::device_only();
+    let builder = client
+        .post(api_url("desktop/weekly_limit"))
+        .header("Authorization", format!("Bearer {token}"));
+    let _ = identity
+        .apply_headers(builder)
+        .json(&serde_json::json!({ "status": status }))
+        .send();
+}
+
 pub fn create_checkout_session(
     subscription_tier: HeadroomSubscriptionTier,
     billing_period: BillingPeriod,
@@ -3209,6 +3259,27 @@ mod tests {
         assert!(status.optimization_allowed);
         assert!(!status.should_nudge);
         assert_eq!(status.nudge_level, 0);
+    }
+
+    #[test]
+    fn weekly_limit_signal_maps_gate_to_nudge() {
+        let (start, end) = grace();
+        let at = |weekly| {
+            evaluate_pricing_status(
+                true,
+                start,
+                end,
+                false,
+                None,
+                Some(expired_account(0.0)),
+                pro_profile_with_weekly(weekly),
+                false,
+                None,
+            )
+        };
+        assert_eq!(super::weekly_limit_signal(&at(20.0)), None);
+        assert_eq!(super::weekly_limit_signal(&at(25.0)), Some("approaching"));
+        assert_eq!(super::weekly_limit_signal(&at(60.0)), Some("reached"));
     }
 
     #[test]

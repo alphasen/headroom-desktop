@@ -439,6 +439,19 @@ where
 
 #[tauri::command]
 async fn restart_app(app: AppHandle) {
+    // Idempotency guard: the frontend "Restart now" button isn't disabled after
+    // the first click (only during install), so a double-click fires this command
+    // twice. Each call arms its own detached `open -n` relauncher, and `open -n`
+    // unconditionally spawns a NEW instance (bypassing single-instance) — two
+    // calls => two app instances running in parallel after an update. Run the
+    // teardown+relaunch at most once per process lifetime.
+    static RESTARTING: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if RESTARTING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        log::info!("restart_app: already in progress, ignoring duplicate invocation");
+        return;
+    }
+
     // Tauri 2.x has an open bug on macOS (tauri-apps/tauri#13923, #11392)
     // where `request_restart()` and `restart()` exit the process but never
     // relaunch — especially with `tauri-plugin-single-instance` loaded.
@@ -2175,6 +2188,7 @@ async fn get_headroom_pricing_status(
     // the next app launch.
     state.apply_pricing_gate_status(&status, crate::client_adapters::is_codex_enabled());
     state.apply_codex_pricing_gate_status(status.codex.as_ref());
+    state.report_weekly_limit_transitions(&status);
     Ok(status)
 }
 
@@ -4280,10 +4294,30 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                 } else if runtime.paused {
                     TrayRuntimeVisual::Paused
                 } else if runtime.installed && !runtime.proxy_reachable {
-                    // Runtime should be up (installed, not paused, not booting)
-                    // but the proxy isn't answering. Treat as unhealthy so the
-                    // user has a visible signal the watchdog is working on it.
-                    TrayRuntimeVisual::Unhealthy
+                    // The fast reachability probe (1.5s via the 6767 intercept)
+                    // missed, but it flaps on transient upstream-connectivity
+                    // blips and brief backend busyness (niced compression /
+                    // embedding) while the process is perfectly alive. Mirror
+                    // the watchdog's tolerance instead of immediately flashing
+                    // "proxy unreachable, attempting restart": re-probe the
+                    // backend /readyz directly, and treat an `ok` or
+                    // upstream-only-503 outcome as healthy (the process is fine;
+                    // only the cached upstream probe is down). Only a genuinely
+                    // non-answering backend shows Unhealthy. This probe runs
+                    // only on the rare !proxy_reachable tick, so its cost is off
+                    // the happy path.
+                    let outcome = probe_backend_readyz_outcome_with_timeout(
+                        std::time::Duration::from_secs(5),
+                    );
+                    if outcome == "ok" || readyz_failure_is_upstream_only(&outcome) {
+                        if cached_connector_enabled {
+                            TrayRuntimeVisual::Running
+                        } else {
+                            TrayRuntimeVisual::Disconnected
+                        }
+                    } else {
+                        TrayRuntimeVisual::Unhealthy
+                    }
                 } else {
                     TrayRuntimeVisual::Off
                 }

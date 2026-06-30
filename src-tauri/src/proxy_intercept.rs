@@ -461,11 +461,18 @@ fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: 
     body.extend_from_slice(chunk);
     let snippet: String = String::from_utf8_lossy(&body).chars().take(2000).collect();
     let path = req_path.to_string();
+    // Group by status so each upstream failure class is its own Sentry issue.
+    // Without an explicit fingerprint, Sentry parameterizes the message
+    // ("codex upstream error {status} on {path}") and collapses 401 noise, 403
+    // challenges and real 502/503 connection errors into one un-triageable
+    // bucket that regresses the moment any sibling status reappears (RUST-46).
+    let status_str = status.to_string();
     sentry::with_scope(
         |scope| {
             scope.set_tag("codex_upstream_status", status);
             scope.set_tag("codex_request_path", &path);
             scope.set_extra("error_body", snippet.clone().into());
+            scope.set_fingerprint(Some(&["codex-upstream-error", status_str.as_str()]));
         },
         || {
             sentry::capture_message(
