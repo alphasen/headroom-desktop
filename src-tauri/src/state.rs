@@ -3114,14 +3114,14 @@ impl AppState {
     pub fn report_weekly_limit_transitions(&self, status: &crate::models::HeadroomPricingStatus) {
         use std::sync::atomic::Ordering::Relaxed;
         match crate::pricing::weekly_limit_signal(status) {
-            Some("reached") => {
+            Some(nudge) if nudge.status == "reached" => {
                 if !self.weekly_limit_reached_reported.swap(true, Relaxed) {
-                    crate::pricing::report_weekly_limit("reached");
+                    crate::pricing::report_weekly_limit(nudge.status, nudge.cap_percent);
                 }
             }
-            Some("approaching") => {
+            Some(nudge) if nudge.status == "approaching" => {
                 if !self.weekly_limit_approaching_reported.swap(true, Relaxed) {
-                    crate::pricing::report_weekly_limit("approaching");
+                    crate::pricing::report_weekly_limit(nudge.status, nudge.cap_percent);
                 }
             }
             _ => {

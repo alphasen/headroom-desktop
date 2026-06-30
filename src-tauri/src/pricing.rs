@@ -968,38 +968,60 @@ pub fn report_milestone(milestone_tokens_saved: u64) {
         .send();
 }
 
+/// The weekly-limit nudge the desktop should report, with the disable threshold
+/// of whichever provider/tier tripped (50% for Pro/Plus, 25% for Max/Pro-x).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeeklyLimitNudge {
+    pub status: &'static str,
+    /// Free-plan weekly cap that gated this provider; `None` if unknown.
+    pub cap_percent: Option<f64>,
+}
+
 /// Maps a freshly evaluated pricing status to the weekly-limit nudge the
 /// desktop should report, or `None`. `"reached"` when the weekly cap has paused
 /// optimization (Claude or Codex); `"approaching"` when nudging near it but not
-/// yet paused. Subscriber filtering and per-window de-duplication are the
-/// server's job (headroom-web `POST /api/v1/desktop/weekly_limit`), so this
-/// stays a pure mapping.
-pub fn weekly_limit_signal(status: &HeadroomPricingStatus) -> Option<&'static str> {
+/// yet paused. The cap reflects whichever provider tripped — Claude's tier-aware
+/// threshold, or the fixed Codex cap. Subscriber filtering and per-window
+/// de-duplication are the server's job (headroom-web
+/// `POST /api/v1/desktop/weekly_limit`), so this stays a pure mapping.
+pub fn weekly_limit_signal(status: &HeadroomPricingStatus) -> Option<WeeklyLimitNudge> {
+    let claude_cap = status.effective_disable_threshold_percent;
+    let codex_cap = Some(CODEX_WEEKLY_DISABLE_THRESHOLD_PCT);
+
     let claude_reached = !status.optimization_allowed
         && matches!(
             status.gate_reason,
             Some(PricingGateReason::WeeklyUsageLimitReached)
         );
+    if claude_reached {
+        return Some(WeeklyLimitNudge { status: "reached", cap_percent: claude_cap });
+    }
     let codex_reached = status
         .codex
         .as_ref()
         .is_some_and(|codex| !codex.optimization_allowed);
-    if claude_reached || codex_reached {
-        return Some("reached");
+    if codex_reached {
+        return Some(WeeklyLimitNudge { status: "reached", cap_percent: codex_cap });
     }
 
-    let approaching = status.should_nudge
-        || status
-            .codex
-            .as_ref()
-            .is_some_and(|codex| codex.should_nudge);
-    approaching.then_some("approaching")
+    if status.should_nudge {
+        return Some(WeeklyLimitNudge { status: "approaching", cap_percent: claude_cap });
+    }
+    let codex_approaching = status
+        .codex
+        .as_ref()
+        .is_some_and(|codex| codex.should_nudge);
+    if codex_approaching {
+        return Some(WeeklyLimitNudge { status: "approaching", cap_percent: codex_cap });
+    }
+    None
 }
 
 /// Fire-and-forget: reports a weekly-limit nudge event ("approaching" or
-/// "reached") so the server can email free-plan users. Mirrors
-/// `report_milestone`: no-ops if the user is not signed in or the request fails.
-pub fn report_weekly_limit(status: &str) {
+/// "reached"), with the free-plan cap that tripped, so the server can email
+/// free-plan users. Mirrors `report_milestone`: no-ops if the user is not
+/// signed in or the request fails.
+pub fn report_weekly_limit(status: &str, cap_percent: Option<f64>) {
     let token = match read_session_token() {
         Ok(Some(t)) => t,
         _ => return,
@@ -1014,7 +1036,10 @@ pub fn report_weekly_limit(status: &str) {
         .header("Authorization", format!("Bearer {token}"));
     let _ = identity
         .apply_headers(builder)
-        .json(&serde_json::json!({ "status": status }))
+        .json(&serde_json::json!({
+            "status": status,
+            "cap_percent": cap_percent.map(|p| p.round() as i64),
+        }))
         .send();
 }
 
@@ -3278,8 +3303,26 @@ mod tests {
             )
         };
         assert_eq!(super::weekly_limit_signal(&at(20.0)), None);
-        assert_eq!(super::weekly_limit_signal(&at(25.0)), Some("approaching"));
-        assert_eq!(super::weekly_limit_signal(&at(60.0)), Some("reached"));
+
+        // Pro tier caps at 50%, so the nudge carries cap_percent: Some(50.0).
+        let approaching = at(25.0);
+        assert_eq!(
+            super::weekly_limit_signal(&approaching),
+            Some(super::WeeklyLimitNudge {
+                status: "approaching",
+                cap_percent: approaching.effective_disable_threshold_percent,
+            })
+        );
+        assert_eq!(approaching.effective_disable_threshold_percent, Some(50.0));
+
+        let reached = at(60.0);
+        assert_eq!(
+            super::weekly_limit_signal(&reached),
+            Some(super::WeeklyLimitNudge {
+                status: "reached",
+                cap_percent: reached.effective_disable_threshold_percent,
+            })
+        );
     }
 
     #[test]
