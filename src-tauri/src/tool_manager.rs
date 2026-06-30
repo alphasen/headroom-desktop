@@ -41,6 +41,13 @@ const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages
 const HEADROOM_PINNED_SHA256: &str =
     "31d3b280e7366a23f54034de15f525c3676e185464caa4e8696cd8ce2bad9fa6";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// markitdown's `--help` cold-imports a much heavier converter stack
+/// (onnxruntime, magika, pdfminer, …) than the core `import headroom`. On
+/// macOS 26 the first run of freshly-installed *unsigned* wheel binaries is
+/// scanned by Gatekeeper/EDR, which routinely pushes that first import past
+/// 15s and trips the smoke-test SIGKILL (RUST-22). It is warn-only, so a too
+/// tight bound just produces Sentry noise and false "addon broken" signals.
+const MARKITDOWN_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Upper bound on the one-time `learn --verbosity` baseline seed run before
 /// proxy start. Typical runs are a few seconds (a ~100MB transcript project
 /// seeds in ~3s); the cap only trips on pathological corpora, after which the
@@ -1013,9 +1020,16 @@ impl ToolManager {
                 }
             }
 
-            let last = failures
-                .pop()
-                .expect("at least one startup variant attempted");
+            // Report the variant that actually captured a log tail (a traceback)
+            // as the error whose tail is carried into Sentry `extra`. Otherwise
+            // an empty-tailed variant can be reported as `last` while a prior
+            // variant holds the real traceback — which `prior_summary` then drops
+            // (it keeps only program/args/reason). Fall back to the last attempt.
+            let chosen = failures
+                .iter()
+                .rposition(|f| !f.log_tail.is_empty())
+                .unwrap_or(failures.len() - 1);
+            let last = failures.remove(chosen);
             let prior_summary = if failures.is_empty() {
                 String::new()
             } else {
@@ -2106,7 +2120,7 @@ impl ToolManager {
     /// base converters and their dependencies import). No-op when the addon
     /// isn't installed, so it can be called unconditionally from a smoke pass.
     pub fn smoke_test_markitdown(&self) -> Result<()> {
-        self.smoke_test_markitdown_with_timeout(HEADROOM_SMOKE_TEST_TIMEOUT)
+        self.smoke_test_markitdown_with_timeout(MARKITDOWN_SMOKE_TEST_TIMEOUT)
     }
 
     fn smoke_test_markitdown_with_timeout(&self, timeout: Duration) -> Result<()> {
@@ -4231,16 +4245,19 @@ fn headroom_python_startup_args() -> Vec<String> {
 }
 
 fn headroom_entrypoint_startup_args() -> Vec<String> {
-    // HTTP/2 on the entrypoint is controlled via the HEADROOM_HTTP2 env var
-    // (set to "false" in the spawn env). Older bundled runtimes ignored this var
-    // and ran HTTP/2 unconditionally, which surfaced as SSLV3_ALERT_BAD_RECORD_MAC
-    // under multi-tab concurrency; the runtime bundled with this build honors it.
-    // --log-messages stores full request/response bodies so the desktop's
-    // Activity tab can render the live transformations feed.
+    // HTTP/2 to upstream is disabled both ways: the explicit --no-http2 flag
+    // AND the HEADROOM_HTTP2=false env var (set in the spawn env). Either alone
+    // suffices, but older bundled runtimes ignored the env var and ran HTTP/2
+    // unconditionally, which surfaced as SSLV3_ALERT_BAD_RECORD_MAC under
+    // multi-tab concurrency. The flag is belt-and-suspenders against a future
+    // runtime regressing on the env var. --log-messages stores full
+    // request/response bodies so the desktop's Activity tab can render the
+    // live transformations feed.
     let mut args = vec![
         "proxy".to_string(),
         "--port".to_string(),
         headroom_proxy_port(),
+        "--no-http2".to_string(),
         "--log-messages".to_string(),
     ];
     args.extend(headroom_learn_startup_args());
@@ -5240,12 +5257,28 @@ where
                         err
                     );
                 } else {
-                    log::warn!(
-                        "pip install attempt {}/{} failed (final): {}",
-                        attempt,
-                        MAX_ATTEMPTS,
-                        compact_pip_failure(&err)
-                    );
+                    let compact = compact_pip_failure(&err);
+                    if crate::is_disk_full_signal(&compact)
+                        || crate::is_disk_full_signal(&format!("{err:#}"))
+                    {
+                        // ENOSPC is environmental and already surfaced + Sentry-
+                        // suppressed by the caller's runtime_upgrade_failed /
+                        // bootstrap_failed guard. Drop this per-attempt warn to
+                        // info so the log->Sentry bridge doesn't recapture it
+                        // (RUST-4C).
+                        log::info!(
+                            "pip install attempt {}/{} failed (final): disk full (ENOSPC)",
+                            attempt,
+                            MAX_ATTEMPTS
+                        );
+                    } else {
+                        log::warn!(
+                            "pip install attempt {}/{} failed (final): {}",
+                            attempt,
+                            MAX_ATTEMPTS,
+                            compact
+                        );
+                    }
                 }
                 last_err = Some(err);
                 if attempt < MAX_ATTEMPTS {
@@ -6386,6 +6419,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
             "proxy".to_string(),
             "--port".to_string(),
             default_port.clone(),
+            "--no-http2".to_string(),
             "--log-messages".to_string(),
         ]));
         assert!(entrypoint_args.contains(&"--learn".to_string()));
