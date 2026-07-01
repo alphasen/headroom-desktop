@@ -121,6 +121,15 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // Ad-hoc codesign of venv native extensions is best-effort (EDR nicety):
+    // codesign exits non-zero when a single .so can't be re-signed, but the
+    // rest are signed and the smoke test is the real gate. A per-file failure
+    // isn't actionable, so keep the log line but drop the Sentry event.
+    if target.starts_with("headroom_desktop_lib::tool_manager")
+        && msg.starts_with("ad-hoc codesign exited")
+    {
+        return true;
+    }
     // Uninstall cleanup is best-effort and races a still-exiting backend/proxy
     // that may re-create a file mid-walk ("Directory not empty"). The removal
     // is retried; a residual failure during teardown isn't actionable.
@@ -298,6 +307,20 @@ mod tests {
         assert!(skip_sentry(
             "headroom_desktop_lib::client_adapters",
             "cleanup: removing /Users/x/Library/Application Support/Headroom failed: Directory not empty (os error 66)"
+        ));
+    }
+
+    #[test]
+    fn skips_adhoc_codesign_best_effort_warning() {
+        assert!(skip_sentry(
+            "headroom_desktop_lib::tool_manager",
+            "ad-hoc codesign exited Some(1) for 633 files: /path/_http_writer.so: replacing existing signature"
+        ));
+        // A genuine signing regression surfaces via the smoke-test gate, not
+        // this best-effort line; an unrelated tool_manager warn still reports.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::tool_manager",
+            "some other tool_manager warning"
         ));
     }
 

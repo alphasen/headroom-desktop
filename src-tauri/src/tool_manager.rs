@@ -872,6 +872,20 @@ impl ToolManager {
                     // were removed; cache mode contributed no measurable savings over
                     // Claude Code's native prefix caching.)
                     .env("HEADROOM_MODE", "token")
+                    // Off-path background compression (#1171). The Kompress ML pass
+                    // over the stable prefix is CPU-bound Rust that releases the GIL,
+                    // so 3+ concurrent Claude Code sessions run their passes in true
+                    // parallel and saturate CPU. Each pass then stretches past the 30s
+                    // COMPRESSION_TIMEOUT; asyncio cancels the awaiter but the Rust
+                    // worker is non-preemptible and keeps burning a core to completion
+                    // (a "leaked thread"), so the machine never drains and every
+                    // session stalls ~30s/request -> apparent freeze. With this on, a
+                    // cold-start-large request forwards uncompressed immediately and
+                    // compresses on a dedicated single-thread background pool that
+                    // never contends with the request path, breaking the cascade.
+                    // Costs first-turn savings per session; steady state recovers once
+                    // the prefix is compressed once.
+                    .env("HEADROOM_BACKGROUND_COMPRESSION", "1")
                     // Pin per-request auth-mode policy enforcement ON. This is what
                     // keeps OAuth/subscription traffic (Claude Code, classified
                     // SUBSCRIPTION by User-Agent) on the conservative

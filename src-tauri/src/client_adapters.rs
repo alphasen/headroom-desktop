@@ -2329,11 +2329,13 @@ def load_config():
 
 
 def reachable():
+    # Any HTTP response means our server answered -- the app is up. A 503 during
+    # bypass mode is still "up", so only connection errors / timeouts count as down.
     try:
-        with urllib.request.urlopen(READYZ, timeout=2) as response:
-            return response.status < 500
-    except urllib.error.HTTPError as exc:
-        return exc.code == 404
+        urllib.request.urlopen(READYZ, timeout=2)
+        return True
+    except urllib.error.HTTPError:
+        return True
     except Exception:
         return False
 
@@ -2344,11 +2346,13 @@ def main():
     if config is None:
         issues.append("~/.codex/config.toml is missing or unreadable")
     else:
-        if config.get("model_provider") != "headroom":
-            issues.append('Codex model_provider is not "headroom"; it is not routing through Headroom')
+        provider_name = config.get("model_provider")
+        if provider_name != "headroom":
+            issues.append('Codex model_provider is "' + str(provider_name) + '" (expected "headroom"); not routing through Headroom')
         provider = (config.get("model_providers") or {{}}).get("headroom") or {{}}
-        if provider.get("base_url") != BASE_URL:
-            issues.append("Headroom provider base_url is not " + BASE_URL)
+        base = provider.get("base_url")
+        if base != BASE_URL:
+            issues.append("Headroom provider base_url is " + str(base) + " (expected " + BASE_URL + ")")
     if not reachable():
         issues.append("Headroom Desktop is not reachable on 127.0.0.1:6767 -- open the app")
 
@@ -2608,19 +2612,55 @@ def notify(message):
 
 
 def reachable():
+    # Any HTTP response means our server answered -- the app is up. A 503 during
+    # bypass mode is still "up", so only connection errors / timeouts count as down.
     try:
-        with urllib.request.urlopen(READYZ, timeout=2) as response:
-            return response.status < 500
-    except urllib.error.HTTPError as exc:
-        return exc.code == 404
+        urllib.request.urlopen(READYZ, timeout=2)
+        return True
+    except urllib.error.HTTPError:
+        return True
     except Exception:
         return False
 
 
+def settings_base(path):
+    # env.ANTHROPIC_BASE_URL from a Claude settings file, or None if absent/unreadable.
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+    except Exception:
+        return None
+    env = data.get("env") if isinstance(data, dict) else None
+    if isinstance(env, dict):
+        value = env.get("ANTHROPIC_BASE_URL")
+        return str(value) if value is not None else None
+    return None
+
+
+def diagnose_route(effective):
+    # Explain WHY the effective route is not Headroom: a higher-precedence settings
+    # scope, an unapplied env (GUI/IDE launch or needs restart), or missing config.
+    shown = effective if effective else "unset"
+    home = os.path.expanduser("~")
+    user_val = settings_base(os.path.join(home, ".claude", "settings.json"))
+    cwd = os.getcwd()
+    for path in (
+        os.path.join(cwd, ".claude", "settings.local.json"),
+        os.path.join(cwd, ".claude", "settings.json"),
+    ):
+        val = settings_base(path)
+        if val is not None and val != BASE_URL:
+            return "ANTHROPIC_BASE_URL=" + shown + " -- " + path + " sets it to " + val + ", which overrides Headroom's route (" + BASE_URL + "). Remove or fix that entry."
+    if user_val == BASE_URL:
+        return "Headroom is configured (user settings = " + BASE_URL + ") but this session started with ANTHROPIC_BASE_URL=" + shown + ". If you launched Claude from an app/IDE it did not inherit the Headroom shell env -- restart Claude Code from a terminal, or reopen the Headroom app."
+    return "ANTHROPIC_BASE_URL is not routed to Headroom in ~/.claude/settings.json (session has " + shown + "). Reopen the Headroom app or re-run client setup."
+
+
 def main():
     issues = []
-    if os.environ.get("ANTHROPIC_BASE_URL") != BASE_URL:
-        issues.append("ANTHROPIC_BASE_URL is not " + BASE_URL + "; Claude is not routing through Headroom")
+    effective = os.environ.get("ANTHROPIC_BASE_URL")
+    if effective != BASE_URL:
+        issues.append(diagnose_route(effective))
     if not reachable():
         issues.append("Headroom Desktop is not reachable on 127.0.0.1:6767 -- open the app")
 
@@ -3726,6 +3766,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
+        build_claude_guard_script, build_codex_guard_script,
         build_headroom_markitdown_hook, build_markitdown_codex_nudge, build_markitdown_office_nudge,
         build_headroom_rtk_hook, claude_code_user_state_exists,
         claude_hook_present_in_value, remove_pre_tool_use_markers,
@@ -5841,5 +5882,28 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert_eq!(provider_count(&db, "headroom"), 2);
         assert_eq!(provider_count(&db, "openai"), 0);
         assert_eq!(provider_count(&db, "anthropic"), 1);
+    }
+
+    #[test]
+    fn claude_guard_script_is_diagnostic_and_reachable_tolerates_any_response() {
+        let script = build_claude_guard_script();
+        // reachable() no longer flags a 503-during-bypass as "app down".
+        assert!(!script.contains("return response.status < 500"));
+        assert!(script.contains("except urllib.error.HTTPError:\n        return True"));
+        // main() explains WHY instead of the flat "is not" message.
+        assert!(script.contains("def diagnose_route"));
+        assert!(script.contains("did not inherit the Headroom shell env"));
+        assert!(script.contains("overrides Headroom's route"));
+        assert!(!script.contains("ANTHROPIC_BASE_URL is not \" + BASE_URL"));
+    }
+
+    #[test]
+    fn codex_guard_script_names_actual_values_and_tolerates_any_response() {
+        let script = build_codex_guard_script();
+        assert!(!script.contains("return response.status < 500"));
+        assert!(script.contains("except urllib.error.HTTPError:\n        return True"));
+        // Messages include the actual found value, not just "is not headroom".
+        assert!(script.contains("(expected \"headroom\")"));
+        assert!(script.contains("(expected \" + BASE_URL + \")"));
     }
 }
