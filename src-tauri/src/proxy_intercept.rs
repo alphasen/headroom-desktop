@@ -31,6 +31,9 @@ use crate::models::{CodexPlanTier, CodexRateLimitSnapshot, CodexUsageWindow};
 pub const INTERCEPT_PORT: u16 = 6767;
 
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+// Request bodies arrive over loopback so even multi-MB payloads land in well
+// under a second; 30s is a generous stall bound, not a throughput budget.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -349,6 +352,14 @@ async fn handle(
     // User-Agent) to keep Codex GUI and Codex CLI on the same backend path.
     if is_codex {
         stamp_codex_client_header(&mut buf);
+    }
+
+    // Force one request per connection so every request gets the full
+    // interception path above — see force_connection_close. WebSocket
+    // handshakes are exempt: the upgrade needs `Connection: Upgrade`, and an
+    // upgraded socket carries no further HTTP request heads to miss.
+    if !request_has_header(&buf, "upgrade") {
+        force_connection_close(&mut buf);
     }
 
     if backend.write_all(&buf).await.is_err() {
@@ -1042,13 +1053,60 @@ async fn forward_direct_to_anthropic(
         upstream_base
     };
 
+    let header_value = |name: &str| {
+        parsed
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+
+    // A WebSocket/upgrade handshake cannot work here: Upgrade/Connection are
+    // hop-by-hop (stripped below) and reqwest issues a plain request. A
+    // deliberate 501 beats forwarding a mangled non-upgrade request upstream.
+    if header_value("upgrade").is_some() {
+        let _ = client
+            .write_all(b"HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return;
+    }
+
+    // A chunked body can't be reassembled here — body reading below tracks
+    // Content-Length only, so forwarding would silently truncate the request.
+    // The CLI clients always send Content-Length; answer 411 honestly for
+    // anything that doesn't.
+    if parsed.content_length.is_none()
+        && header_value("transfer-encoding")
+            .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
+    {
+        let _ = client
+            .write_all(b"HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return;
+    }
+
+    // An `Expect: 100-continue` client holds the body back until it sees the
+    // interim response — without this it deadlocks against our body read
+    // below until one side times out.
+    if header_value("expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
+        && client
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await
+            .is_err()
+    {
+        return;
+    }
+
     let body = match parsed.content_length {
         Some(total) if total > leftover_body.len() => {
             let mut body = Vec::with_capacity(total);
             body.extend_from_slice(leftover_body);
             let mut remaining = vec![0u8; total - leftover_body.len()];
-            if client.read_exact(&mut remaining).await.is_err() {
-                return;
+            // Timeout like every other socket read in this file — a client
+            // that stalls mid-body must not pin this task forever.
+            match tokio::time::timeout(BODY_READ_TIMEOUT, client.read_exact(&mut remaining)).await {
+                Ok(Ok(_)) => {}
+                _ => return,
             }
             body.extend_from_slice(&remaining);
             body
@@ -1313,6 +1371,31 @@ fn strip_request_header(buf: &mut Vec<u8>, name: &str) {
     }
 }
 
+/// Rewrite the request head to `Connection: close` so the backend closes the
+/// connection after one response (and echoes the header, so the client opens
+/// a fresh connection for its next request instead of reusing this one).
+///
+/// Everything this proxy does per request — origin check, bearer capture,
+/// lite-header strip, `X-Client: codex` stamp — is applied only to the first
+/// request head on a connection; after that the socket is an opaque splice,
+/// so a keep-alive reuse would carry a second request past all of it. One
+/// request per connection makes the interception complete by construction,
+/// at the cost of a loopback TCP handshake per request. No-op if the header
+/// terminator is missing.
+fn force_connection_close(buf: &mut Vec<u8>) {
+    if find_header_end(buf).is_none() {
+        return;
+    }
+    while request_has_header(buf, "connection") {
+        strip_request_header(buf, "connection");
+    }
+    let Some(end) = find_header_end(buf) else {
+        return;
+    };
+    let insert_at = end + 2;
+    buf.splice(insert_at..insert_at, *b"Connection: close\r\n");
+}
+
 /// Insert `X-Client: codex` into a request head so the Python backend's
 /// `classify_client` identifies Codex traffic even when the client's
 /// User-Agent isn't `codex-cli/` (e.g. the Codex GUI/IDE). A client that
@@ -1409,8 +1492,12 @@ fn host_is_loopback(host: &str) -> bool {
 }
 
 /// Extract the bearer token value from raw HTTP request bytes, if present.
+/// Only the header block is scanned: `read_http_headers` over-reads, so `buf`
+/// can carry the start of the body, and body bytes must never be able to
+/// plant an Authorization line that poisons the captured token.
 fn extract_bearer(buf: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(buf).ok()?;
+    let end = find_header_end(buf).unwrap_or(buf.len());
+    let text = std::str::from_utf8(&buf[..end]).ok()?;
     for line in text.lines() {
         let lower = line.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("authorization:") {
@@ -1479,6 +1566,20 @@ mod tests {
     fn extracts_bearer_token_case_insensitively() {
         let request = b"POST / HTTP/1.1\r\nAuthorization: Bearer test-token\r\n\r\n";
         assert_eq!(extract_bearer(request).as_deref(), Some("test-token"));
+    }
+
+    #[test]
+    fn extract_bearer_ignores_authorization_lines_in_the_body() {
+        // read_http_headers over-reads, so the buffer can contain body bytes.
+        // A body line that looks like an Authorization header must not be
+        // captured as a credential.
+        let request = b"POST / HTTP/1.1\r\nContent-Type: text/plain\r\n\r\nAuthorization: Bearer attacker-value\r\n";
+        assert_eq!(extract_bearer(request), None);
+
+        // A real header still wins with body bytes present.
+        let request =
+            b"POST / HTTP/1.1\r\nAuthorization: Bearer real\r\n\r\nAuthorization: Bearer fake\r\n";
+        assert_eq!(extract_bearer(request).as_deref(), Some("real"));
     }
 
     #[test]
@@ -1875,6 +1976,41 @@ mod tests {
         let mut buf = b"POST /v1/responses HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
         let original = buf.clone();
         strip_request_header(&mut buf, "X-OpenAI-Internal-Codex-Responses-Lite");
+        assert_eq!(buf, original);
+    }
+
+    #[test]
+    fn force_connection_close_replaces_keep_alive_and_preserves_body() {
+        let mut buf =
+            b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n{\"a\":1}"
+                .to_vec();
+        super::force_connection_close(&mut buf);
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("Connection: close\r\n"));
+        assert!(!text.contains("keep-alive"));
+        assert!(
+            text.ends_with("\r\n\r\n{\"a\":1}"),
+            "body preserved: {text}"
+        );
+        assert_eq!(text.matches("Connection:").count(), 1);
+    }
+
+    #[test]
+    fn force_connection_close_inserts_when_no_connection_header() {
+        let mut buf = b"GET /v1/models HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
+        super::force_connection_close(&mut buf);
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("Connection: close\r\n"));
+        // Still exactly one header terminator, at the end.
+        assert!(text.ends_with("\r\n\r\n"));
+        assert_eq!(text.matches("\r\n\r\n").count(), 1);
+    }
+
+    #[test]
+    fn force_connection_close_noop_without_terminator() {
+        let mut buf = b"GET / HTTP/1.1\r\nHost: x\r\n".to_vec();
+        let original = buf.clone();
+        super::force_connection_close(&mut buf);
         assert_eq!(buf, original);
     }
 

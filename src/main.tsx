@@ -1,20 +1,8 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import * as Sentry from "@sentry/react";
-import Clarity from "@microsoft/clarity";
 import App from "./App";
 import "./styles.css";
-
-// Clarity is only enabled outside the EEA/UK to avoid GDPR consent requirements.
-// Microsoft's own FAQ confirms explicit consent is required for EEA users.
-const isEEA = Intl.DateTimeFormat().resolvedOptions().timeZone.startsWith("Europe/");
-if (!isEEA) {
-  Clarity.init(import.meta.env.VITE_CLARITY_PROJECT_ID);
-  Clarity.consent(!document.hidden);
-  document.addEventListener("visibilitychange", () => {
-    Clarity.consent(!document.hidden);
-  });
-}
 
 Sentry.init({
   dsn: import.meta.env.VITE_SENTRY_DSN,

@@ -1639,10 +1639,6 @@ impl ToolManager {
         Ok(())
     }
 
-    pub fn bootstrap_all(&self) -> Result<ManagedRuntime> {
-        self.bootstrap_all_with_progress(|_| {})
-    }
-
     pub fn bootstrap_all_with_progress<F>(&self, mut progress: F) -> Result<ManagedRuntime>
     where
         F: FnMut(BootstrapStepUpdate),
@@ -3433,21 +3429,34 @@ impl ToolManager {
             );
         }
 
+        // Stage next to the destination, then rename into place: rtk is
+        // exec'd by the PreToolUse hook on nearly every agent Bash command,
+        // so copying over the live binary opens a truncated-exec window (and
+        // fails with ETXTBSY on Linux while an rtk is running). Rename is
+        // atomic for exec.
         let destination = self.rtk_entrypoint();
-        std::fs::copy(&extracted_binary, &destination)
-            .with_context(|| format!("writing {}", destination.display()))?;
+        let staged = {
+            let mut s = destination.as_os_str().to_os_string();
+            s.push(".new");
+            PathBuf::from(s)
+        };
+        std::fs::copy(&extracted_binary, &staged)
+            .with_context(|| format!("writing {}", staged.display()))?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
 
-            let mut permissions = std::fs::metadata(&destination)
-                .with_context(|| format!("reading {}", destination.display()))?
+            let mut permissions = std::fs::metadata(&staged)
+                .with_context(|| format!("reading {}", staged.display()))?
                 .permissions();
             permissions.set_mode(0o755);
-            std::fs::set_permissions(&destination, permissions)
-                .with_context(|| format!("chmod {}", destination.display()))?;
+            std::fs::set_permissions(&staged, permissions)
+                .with_context(|| format!("chmod {}", staged.display()))?;
         }
+
+        std::fs::rename(&staged, &destination)
+            .with_context(|| format!("renaming {} into place", staged.display()))?;
 
         self.write_tool_receipt(
             "rtk",
@@ -3960,13 +3969,26 @@ fn write_headroom_to_claude_json(entrypoint: &Path, proxy_url: &str) -> Result<(
     let Some(home) = dirs::home_dir() else {
         anyhow::bail!("home directory not available");
     };
-    let path = home.join(".claude.json");
+    write_headroom_to_claude_json_at(&home.join(".claude.json"), entrypoint, proxy_url)
+}
 
+fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &str) -> Result<()> {
+    // ~/.claude.json holds OAuth state and per-project settings, and Claude
+    // Code rewrites it frequently. A read or parse failure here (e.g. a
+    // mid-write partial file) must never degrade to an empty object, or the
+    // write below replaces the user's entire config with just our entry.
     let mut config: Value = if path.exists() {
-        std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_else(|| json!({}))
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+            json!({})
+        } else {
+            serde_json::from_slice(&bytes).with_context(|| {
+                format!(
+                    "parsing {} failed; refusing to overwrite potentially valid user config",
+                    path.display()
+                )
+            })?
+        }
     } else {
         json!({})
     };
@@ -3988,8 +4010,16 @@ fn write_headroom_to_claude_json(entrypoint: &Path, proxy_url: &str) -> Result<(
             }),
         );
 
-    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)
-        .with_context(|| format!("writing {}", path.display()))
+    let _ = crate::client_adapters::backup_if_exists(path)?;
+
+    // Publish atomically (tmp + rename) so a crash mid-write can never leave
+    // a truncated ~/.claude.json behind.
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".headroom-tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&config)?)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming {} into place", tmp.display()))
 }
 
 fn is_local_proxy_reachable() -> bool {
@@ -6196,7 +6226,9 @@ mod tests {
         let runtime = ManagedRuntime::bootstrap_root(&root);
         let manager = ToolManager::new(runtime.clone());
 
-        manager.bootstrap_all().expect("bootstrap succeeds");
+        manager
+            .bootstrap_all_with_progress(|_| {})
+            .expect("bootstrap succeeds");
 
         assert!(runtime.managed_python().exists());
         assert!(runtime.tools_dir.join("headroom.json").exists());
@@ -7904,5 +7936,58 @@ exit 0
         cap.push("a");
         cap.push("b");
         assert_eq!(cap.into_string(), "a\nb");
+    }
+
+    #[test]
+    fn claude_json_write_preserves_existing_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        fs::write(
+            &path,
+            r#"{"oauthAccount":{"id":"abc"},"projects":{"/x":{}}}"#,
+        )
+        .unwrap();
+
+        super::write_headroom_to_claude_json_at(&path, Path::new("/bin/headroom"), "http://p")
+            .unwrap();
+
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after["oauthAccount"]["id"], "abc");
+        assert!(after["projects"]["/x"].is_object());
+        assert_eq!(after["mcpServers"]["headroom"]["command"], "/bin/headroom");
+    }
+
+    #[test]
+    fn claude_json_write_refuses_to_clobber_unparseable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        fs::write(&path, r#"{"oauthAccount":{"id":"ab"#).unwrap(); // truncated mid-write
+
+        let err =
+            super::write_headroom_to_claude_json_at(&path, Path::new("/bin/headroom"), "http://p")
+                .unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"));
+        // Original bytes untouched.
+        assert_eq!(fs::read(&path).unwrap(), br#"{"oauthAccount":{"id":"ab"#);
+    }
+
+    #[test]
+    fn claude_json_write_treats_empty_file_as_fresh_and_backs_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        fs::write(&path, "  \n").unwrap();
+
+        super::write_headroom_to_claude_json_at(&path, Path::new("/bin/headroom"), "http://p")
+            .unwrap();
+
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(after["mcpServers"]["headroom"].is_object());
+        // Backup taken, no tmp file left behind.
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|n| n.contains(".headroom-backup-")));
+        assert!(!names.iter().any(|n| n.ends_with(".headroom-tmp")));
     }
 }

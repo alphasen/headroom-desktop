@@ -260,8 +260,18 @@ impl ActivityFacts {
         }
 
         let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        let persisted = serde_json::from_slice::<PersistedActivityFacts>(&bytes)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        // A corrupt file (e.g. truncated by a crash mid-write) must never
+        // brick launch: an Err here propagates to AppState::new()'s expect()
+        // and panics on every start until the user deletes the file by hand.
+        // Recover the same way as a schema mismatch below.
+        let persisted = match serde_json::from_slice::<PersistedActivityFacts>(&bytes) {
+            Ok(persisted) => persisted,
+            Err(err) => {
+                log::warn!("activity-facts.json is corrupt ({err}); starting fresh");
+                let _ = std::fs::remove_file(&path);
+                return Ok(Self::empty(path));
+            }
+        };
         if persisted.schema_version != SCHEMA_VERSION {
             // Best-effort delete so the next save replaces the stale file
             // outright rather than silently leaving the old payload behind.
@@ -826,8 +836,7 @@ impl ActivityFacts {
             last_train_suggestion: self.last_train_suggestion.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&persisted).context("serializing activity facts")?;
-        std::fs::write(&self.path, bytes)
-            .with_context(|| format!("writing {}", self.path.display()))?;
+        crate::client_adapters::atomic_write(&self.path, &bytes)?;
         self.dirty = false;
         Ok(())
     }
@@ -860,6 +869,19 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Timelike};
     use tempfile::TempDir;
+
+    #[test]
+    fn load_or_create_survives_unparseable_file() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().to_path_buf();
+        let path = base.join("config").join("activity-facts.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{\"schemaVersion\": 3, trunc").unwrap();
+
+        let facts = ActivityFacts::load_or_create(&base).expect("corrupt file must not error");
+        assert_eq!(facts.all_time_record_tokens, 0);
+        assert!(!path.exists(), "corrupt file is removed for a fresh start");
+    }
 
     fn mk_transformation(
         model: Option<&str>,

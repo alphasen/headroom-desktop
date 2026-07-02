@@ -141,6 +141,22 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     false
 }
 
+/// Replace the user's home directory with `~` wherever it appears.
+fn scrub_home(msg: &str) -> String {
+    match dirs::home_dir() {
+        Some(home) => {
+            let home = home.to_string_lossy();
+            let home = home.trim_end_matches('/');
+            if home.is_empty() {
+                msg.to_string()
+            } else {
+                msg.replace(home, "~")
+            }
+        }
+        None => msg.to_string(),
+    }
+}
+
 impl Log for FileLogger {
     fn enabled(&self, _meta: &Metadata) -> bool {
         true
@@ -168,7 +184,10 @@ impl Log for FileLogger {
                 Level::Error => sentry::Level::Error,
                 _ => sentry::Level::Warning,
             };
-            let truncated: String = msg.chars().take(SENTRY_MESSAGE_CHAR_CAP).collect();
+            // Home paths embed the local username; replace with ~ so it
+            // never leaves the machine.
+            let scrubbed = scrub_home(&msg);
+            let truncated: String = scrubbed.chars().take(SENTRY_MESSAGE_CHAR_CAP).collect();
             sentry::capture_message(&truncated, level);
         }
     }
@@ -340,5 +359,20 @@ mod tests {
             "headroom_desktop_lib::state",
             "some other state warning"
         ));
+    }
+
+    #[test]
+    fn scrub_home_replaces_home_dir_with_tilde() {
+        let home = dirs::home_dir().unwrap();
+        let msg = format!(
+            "cleanup: removing {}/Library/Application Support/x",
+            home.display()
+        );
+        let scrubbed = super::scrub_home(&msg);
+        assert_eq!(
+            scrubbed,
+            "cleanup: removing ~/Library/Application Support/x"
+        );
+        assert_eq!(super::scrub_home("no paths here"), "no paths here");
     }
 }

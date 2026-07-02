@@ -1,7 +1,9 @@
 // Debug builds store secrets in plain files under the app data dir so that the
 // keychain is never touched and macOS never shows an access prompt during development.
-// Release builds use the macOS Data Protection Keychain (requires the keychain-access-groups
-// entitlement present in Entitlements.plist).
+// Release builds use the legacy login keychain via the Security framework with
+// default ACL/accessibility (kSecClass/kSecAttrService/kSecAttrAccount only —
+// no kSecUseDataProtectionKeychain, which would additionally require the
+// keychain-access-groups entitlement that Entitlements.plist does not carry).
 
 // ── Debug: file-based store ──────────────────────────────────────────────────
 
@@ -47,7 +49,7 @@ mod platform {
     }
 }
 
-// ── Release / macOS: Data Protection Keychain ────────────────────────────────
+// ── Release / macOS: login keychain (Security framework) ────────────────────
 
 #[cfg(all(not(debug_assertions), target_os = "macos"))]
 mod platform {

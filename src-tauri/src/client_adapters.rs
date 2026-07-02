@@ -880,12 +880,11 @@ fn remove_pre_tool_use_markers(settings_path: &Path, markers: &[&str]) -> Result
     }
 
     let _ = backup_if_exists(settings_path)?;
-    std::fs::write(
+    atomic_write(
         settings_path,
-        serde_json::to_vec_pretty(&Value::Object(root))
+        &serde_json::to_vec_pretty(&Value::Object(root))
             .context("serializing Claude settings for hook cleanup")?,
-    )
-    .with_context(|| format!("writing {}", settings_path.display()))?;
+    )?;
 
     Ok(true)
 }
@@ -1127,21 +1126,25 @@ fn write_setup_state(state: &ClientSetupState) -> Result<()> {
     let path = setup_state_path();
     let payload = serde_json::to_vec_pretty(state).context("serializing client setup state")?;
 
-    // Publish atomically: write to a sibling tmp file then rename. POSIX
-    // rename is atomic, so concurrent readers (e.g. the tray-icon thread
-    // calling `is_claude_code_enabled` every 2s) see either the old file or
-    // the new one — never a half-written truncate. The previous direct
-    // `fs::write` opened a microsecond window where readers parsed an empty
-    // file, concluded no clients were configured, and flipped the tray to
-    // "Disconnected" with a spurious notification.
+    atomic_write(&path, &payload)
+}
+
+/// Write via a sibling tmp file then rename. POSIX rename is atomic, so
+/// concurrent readers (other apps parsing their own config, the tray-icon
+/// thread calling `is_claude_code_enabled` every 2s) see either the old file
+/// or the new one — never a half-written truncate. A plain `fs::write` also
+/// leaves a truncated file behind on crash/power loss mid-write, which for
+/// user-owned configs (settings.json, config.toml, shell rc files) breaks the
+/// user's shell or client startup.
+pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     let tmp_path = {
-        let mut s = path.clone().into_os_string();
+        let mut s = path.as_os_str().to_os_string();
         s.push(".tmp");
         PathBuf::from(s)
     };
-    std::fs::write(&tmp_path, &payload)
+    std::fs::write(&tmp_path, contents)
         .with_context(|| format!("writing {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, &path)
+    std::fs::rename(&tmp_path, path)
         .with_context(|| format!("renaming {} -> {}", tmp_path.display(), path.display()))
 }
 
@@ -1426,9 +1429,9 @@ fn set_markitdown_bash_permission(shim_path: &Path, present: bool) -> Result<boo
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let _ = backup_if_exists(&settings_path)?;
-    std::fs::write(
+    atomic_write(
         &settings_path,
-        serde_json::to_vec_pretty(&content).context("serializing Claude permissions settings")?,
+        &serde_json::to_vec_pretty(&content).context("serializing Claude permissions settings")?,
     )
     .with_context(|| format!("writing {}", settings_path.display()))?;
     Ok(true)
@@ -1539,9 +1542,9 @@ fn configure_claude_settings_env(
     }
 
     let backup = backup_if_exists(&settings_path)?;
-    std::fs::write(
+    atomic_write(
         &settings_path,
-        serde_json::to_vec_pretty(&content).context("serializing Claude settings")?,
+        &serde_json::to_vec_pretty(&content).context("serializing Claude settings")?,
     )
     .with_context(|| format!("writing {}", settings_path.display()))?;
 
@@ -1628,9 +1631,9 @@ fn ensure_claude_settings_hook(
     }
 
     let backup = backup_if_exists(&settings_path)?;
-    std::fs::write(
+    atomic_write(
         &settings_path,
-        serde_json::to_vec_pretty(&content).context("serializing Claude hook settings")?,
+        &serde_json::to_vec_pretty(&content).context("serializing Claude hook settings")?,
     )
     .with_context(|| format!("writing {}", settings_path.display()))?;
 
@@ -1667,12 +1670,11 @@ fn remove_claude_settings_env(env_key: &str, expected_value: &str) -> Result<()>
     }
 
     let _ = backup_if_exists(&settings_path)?;
-    std::fs::write(
+    atomic_write(
         &settings_path,
-        serde_json::to_vec_pretty(&Value::Object(root))
+        &serde_json::to_vec_pretty(&Value::Object(root))
             .context("serializing Claude settings for connector removal")?,
-    )
-    .with_context(|| format!("writing {}", settings_path.display()))?;
+    )?;
 
     Ok(())
 }
@@ -1753,12 +1755,11 @@ fn remove_legacy_vscode_base_url_keys() -> Result<(Vec<String>, Vec<String>)> {
     }
 
     let backup = backup_if_exists(&settings_path)?;
-    std::fs::write(
+    atomic_write(
         &settings_path,
-        serde_json::to_vec_pretty(&Value::Object(obj))
+        &serde_json::to_vec_pretty(&Value::Object(obj))
             .context("serializing VS Code settings for legacy key cleanup")?,
-    )
-    .with_context(|| format!("writing {}", settings_path.display()))?;
+    )?;
 
     Ok((
         vec![settings_path.display().to_string()],
@@ -2108,7 +2109,7 @@ fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>)> {
     }
 
     let backup = backup_if_exists(&path)?;
-    std::fs::write(&path, &updated).with_context(|| format!("writing {}", path.display()))?;
+    atomic_write(&path, updated.as_bytes())?;
 
     let mut backup_files = Vec::new();
     if let Some(backup_path) = backup {
@@ -2146,8 +2147,16 @@ pub fn pin_codex_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
 
     let mut in_headroom_table = false;
     let mut replaced = false;
+    // When the replaced `args` value is a multi-line array, the continuation
+    // lines ("-m", / "headroom.cli", / ]) must be dropped too, or the rebuilt
+    // file is invalid TOML and Codex fails to load its config entirely.
+    let mut skip_array_depth: i32 = 0;
     let mut out: Vec<String> = Vec::with_capacity(content.lines().count());
     for line in content.lines() {
+        if skip_array_depth > 0 {
+            skip_array_depth += bracket_delta(line);
+            continue;
+        }
         let trimmed = line.trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
             in_headroom_table = trimmed == "[mcp_servers.headroom]";
@@ -2155,14 +2164,18 @@ pub fn pin_codex_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
             continue;
         }
         if in_headroom_table {
-            match trimmed.split_once('=').map(|(key, _)| key.trim()) {
-                Some("command") => {
+            match trimmed
+                .split_once('=')
+                .map(|(key, value)| (key.trim(), value))
+            {
+                Some(("command", _)) => {
                     out.push(target_line.clone());
                     replaced = true;
                     continue;
                 }
-                Some("args") => {
+                Some(("args", value)) => {
                     out.push(target_args_line.to_string());
+                    skip_array_depth = bracket_delta(value).max(0);
                     continue;
                 }
                 _ => {}
@@ -2181,9 +2194,40 @@ pub fn pin_codex_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
     if rebuilt == content {
         return Ok(None);
     }
+    // Never publish a config Codex can't parse — bail and leave the user's
+    // file untouched instead.
+    toml::from_str::<toml::Value>(&rebuilt).with_context(|| {
+        format!(
+            "rebuilt {} is not valid TOML; refusing to overwrite",
+            path.display()
+        )
+    })?;
     let _ = backup_if_exists(&path)?;
-    std::fs::write(&path, rebuilt).with_context(|| format!("writing {}", path.display()))?;
+    atomic_write(&path, rebuilt.as_bytes())?;
     Ok(Some(path.display().to_string()))
+}
+
+/// Net `[` minus `]` on a line, ignoring brackets inside basic strings.
+/// Good enough for tracking whether a TOML array value has closed.
+fn bracket_delta(line: &str) -> i32 {
+    let mut delta = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in line.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            '#' if !in_string => break,
+            '[' if !in_string => delta += 1,
+            ']' if !in_string => delta -= 1,
+            _ => {}
+        }
+    }
+    delta
 }
 
 fn toml_basic_string(value: &str) -> String {
@@ -2239,7 +2283,7 @@ fn remove_codex_provider_block() -> Result<()> {
         return Ok(());
     }
     let _ = backup_if_exists(&path)?;
-    std::fs::write(&path, &normalized).with_context(|| format!("writing {}", path.display()))?;
+    atomic_write(&path, normalized.as_bytes())?;
     Ok(())
 }
 
@@ -2251,9 +2295,19 @@ fn remove_codex_toml_key(key: &str, expected_value: &str) -> Result<()> {
     let content =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let target_line = format!("{key} = \"{expected_value}\"");
+    // Only remove the key from the root table: an identical `key = value`
+    // line inside some other table ([profiles.x], a user's own server entry)
+    // belongs to that table, not to the block we installed.
+    let mut in_root_table = true;
     let filtered: Vec<&str> = content
         .lines()
-        .filter(|l| l.trim() != target_line)
+        .filter(|l| {
+            let trimmed = l.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                in_root_table = false;
+            }
+            !(in_root_table && trimmed == target_line)
+        })
         .collect();
     if filtered.len() == content.lines().count() {
         return Ok(());
@@ -2263,7 +2317,7 @@ fn remove_codex_toml_key(key: &str, expected_value: &str) -> Result<()> {
     if !result.ends_with('\n') && !result.is_empty() {
         result.push('\n');
     }
-    std::fs::write(&path, result).with_context(|| format!("writing {}", path.display()))?;
+    atomic_write(&path, result.as_bytes())?;
     Ok(())
 }
 
@@ -2481,11 +2535,10 @@ fn register_guard_hook_entries(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(
+    atomic_write(
         hooks_path,
-        serde_json::to_vec_pretty(&content).context("serializing hooks file")?,
-    )
-    .with_context(|| format!("writing {}", hooks_path.display()))?;
+        &serde_json::to_vec_pretty(&content).context("serializing hooks file")?,
+    )?;
 
     let mut backups = Vec::new();
     if let Some(backup) = backup {
@@ -2562,11 +2615,10 @@ fn remove_guard_hook_entries(
     if delete_if_empty && root_empty {
         let _ = std::fs::remove_file(hooks_path);
     } else {
-        std::fs::write(
+        atomic_write(
             hooks_path,
-            serde_json::to_vec_pretty(&content).context("serializing hooks file")?,
-        )
-        .with_context(|| format!("writing {}", hooks_path.display()))?;
+            &serde_json::to_vec_pretty(&content).context("serializing hooks file")?,
+        )?;
     }
     Ok(())
 }
@@ -2870,8 +2922,7 @@ fn upsert_managed_block(
     }
 
     let backup = backup_if_exists(file_path)?;
-    std::fs::write(file_path, updated)
-        .with_context(|| format!("writing {}", file_path.display()))?;
+    atomic_write(file_path, updated.as_bytes())?;
     Ok((true, backup))
 }
 
@@ -2910,8 +2961,7 @@ fn write_file_if_changed(
     }
 
     let backup = backup_if_exists(file_path)?;
-    std::fs::write(file_path, content)
-        .with_context(|| format!("writing {}", file_path.display()))?;
+    atomic_write(file_path, content.as_bytes())?;
 
     #[cfg(unix)]
     if executable {
@@ -2962,12 +3012,11 @@ fn remove_managed_block(file_path: &Path, block_id: &str) -> Result<bool> {
     }
 
     let _ = backup_if_exists(file_path)?;
-    std::fs::write(file_path, rebuilt)
-        .with_context(|| format!("writing {}", file_path.display()))?;
+    atomic_write(file_path, rebuilt.as_bytes())?;
     Ok(true)
 }
 
-fn backup_if_exists(path: &Path) -> Result<Option<PathBuf>> {
+pub(crate) fn backup_if_exists(path: &Path) -> Result<Option<PathBuf>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -3757,12 +3806,22 @@ pub(crate) fn codex_logged_in() -> bool {
 fn parse_json_object(raw: &str, path: &Path) -> Result<serde_json::Map<String, Value>> {
     let value: Value = match serde_json::from_str(raw) {
         Ok(value) => value,
-        Err(_) => json5::from_str(raw).with_context(|| {
-            format!(
-                "parsing {} failed (JSON/JSON5); refusing to overwrite potentially valid user settings",
+        Err(_) => {
+            let value = json5::from_str(raw).with_context(|| {
+                format!(
+                    "parsing {} failed (JSON/JSON5); refusing to overwrite potentially valid user settings",
+                    path.display()
+                )
+            })?;
+            // Writers re-serialize with serde_json, which strips the
+            // comments/relaxed syntax that forced the JSON5 fallback. Say so
+            // instead of silently normalizing the user's file.
+            log::warn!(
+                "{} contains JSON5 syntax (comments/trailing commas); a Headroom rewrite will normalize it to strict JSON — the original is kept as a .headroom-backup file",
                 path.display()
-            )
-        })?,
+            );
+            value
+        }
     };
     value
         .as_object()
@@ -6062,6 +6121,41 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "python -m args must be normalized, got:\n{after}"
         );
         assert!(!after.contains("-m"), "no -m leftovers, got:\n{after}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pin_codex_mcp_command_handles_multi_line_args_array() {
+        let home = TestHome::new();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        let config = codex.join("config.toml");
+        std::fs::write(
+            &config,
+            "[mcp_servers.headroom]\n\
+             command = \"/somewhere/venv/bin/python3\"\n\
+             args = [\n  \"-m\",\n  \"headroom.cli\",\n  \"mcp\",\n  \"serve\",\n]\n\
+             \n\
+             [mcp_servers.headroom.env]\n\
+             HEADROOM_PROXY_URL = \"http://127.0.0.1:6767\"\n",
+        )
+        .unwrap();
+
+        let entrypoint = home.path().join("venv/bin/headroom");
+        assert!(pin_codex_mcp_command(&entrypoint).unwrap().is_some());
+
+        let after = std::fs::read_to_string(&config).unwrap();
+        // No orphaned continuation lines — the rebuilt file must parse.
+        let parsed: toml::Value = toml::from_str(&after).expect("rebuilt config parses");
+        assert_eq!(
+            parsed["mcp_servers"]["headroom"]["args"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(after.contains("[mcp_servers.headroom.env]"));
+        assert!(!after.contains("headroom.cli"));
     }
 
     #[test]

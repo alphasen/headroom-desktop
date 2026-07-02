@@ -1,6 +1,6 @@
 {
   "name": "headroom-desktop",
-  "version": "0.5.9-rc.4",
+  "version": "0.5.9-rc.5",
   "private": true,
   "type": "module",
   "scripts": {
@@ -18,7 +18,6 @@
     "check:colors": "./scripts/check-colors.sh"
   },
   "dependencies": {
-    "@microsoft/clarity": "^1.0.2",
     "@phosphor-icons/react": "^2.1.10",
     "@sentry/react": "^10.47.0",
     "@tauri-apps/api": "^2.0.0",

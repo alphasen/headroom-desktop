@@ -837,25 +837,6 @@ async fn uninstall_addon(
     Ok(state.dashboard())
 }
 
-#[tauri::command]
-fn bootstrap_runtime(state: State<'_, AppState>) -> Result<DashboardState, String> {
-    state
-        .tool_manager
-        .bootstrap_all()
-        .map_err(|err| err.to_string())?;
-    if let Err(err) = client_adapters::ensure_rtk_integrations(
-        &state.tool_manager.rtk_entrypoint(),
-        &state.tool_manager.managed_python(),
-    ) {
-        log::warn!("RTK integrations failed after bootstrap_runtime: {err:#}");
-    }
-    state
-        .ensure_headroom_running()
-        .map_err(|err| format!("bootstrap complete but failed to start headroom: {err}"))?;
-
-    Ok(state.dashboard())
-}
-
 fn emit_bootstrap_progress(app: &AppHandle, state: &AppState) {
     let _ = app.emit("bootstrap_progress", state.bootstrap_progress());
 }
@@ -1979,8 +1960,17 @@ fn dismiss_runtime_upgrade_failure(state: State<'_, AppState>) -> Result<(), Str
 }
 
 #[tauri::command]
-fn get_runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
-    state.runtime_status()
+async fn get_runtime_status(app: AppHandle) -> Result<RuntimeStatus, String> {
+    // Off the main thread: a cache miss inside runtime_status() does a
+    // blocking /readyz probe with a 1500ms timeout against two hosts, and the
+    // frontend polls this command on a 3s interval — a sync command would
+    // freeze the UI for the probe duration whenever the proxy is down.
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        state.runtime_status()
+    })
+    .await
+    .map_err(|err| err.to_string())
 }
 
 /// Debug-only: force the proxy intercept's bypass flag on/off so a developer
@@ -3434,7 +3424,6 @@ pub fn run() {
             install_addon,
             set_addon_enabled,
             uninstall_addon,
-            bootstrap_runtime,
             start_bootstrap,
             get_bootstrap_progress,
             get_runtime_upgrade_progress,

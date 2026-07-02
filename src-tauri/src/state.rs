@@ -891,6 +891,21 @@ impl AppState {
         *self.runtime_upgrade_in_progress.lock() = true;
         self.invalidate_runtime_status_cache();
 
+        // Clear the flag on EVERY exit, including a panic anywhere in the
+        // ~500-line body below. This runs on a bare spawned thread with no
+        // catch_unwind and parking_lot mutexes don't poison, so without this
+        // guard a panic would leave the flag stuck true for the process
+        // lifetime — which disables the watchdog auto-pause and suppresses
+        // the pricing gate (see ensure_headroom_running) until app restart.
+        struct UpgradeFlagGuard<'a>(&'a AppState);
+        impl Drop for UpgradeFlagGuard<'_> {
+            fn drop(&mut self) {
+                *self.0.runtime_upgrade_in_progress.lock() = false;
+                self.0.invalidate_runtime_status_cache();
+            }
+        }
+        let _upgrade_flag_guard = UpgradeFlagGuard(self);
+
         // Set up progress state + emit initial event.
         self.set_upgrade_progress(|p| {
             p.running = true;
@@ -922,17 +937,15 @@ impl AppState {
 
         let start = std::time::Instant::now();
         let app_for_progress = app.clone();
-        // SAFETY: self has a stable address for the duration of this call; the
-        // closure runs inline and does not outlive this scope.
-        let self_ptr: *const AppState = self as *const AppState;
+        // The callees only require FnMut (no 'static/Send), so capturing
+        // &self directly is fine and keeps the borrow checker in play.
         let progress = move |step: BootstrapStepUpdate| {
-            let state_ref = unsafe { &*self_ptr };
-            state_ref.set_upgrade_progress(|p| {
+            self.set_upgrade_progress(|p| {
                 p.current_step = step.step.to_string();
                 p.message = step.message.clone();
                 p.overall_percent = step.percent;
             });
-            emit_runtime_upgrade_progress(&app_for_progress, state_ref);
+            emit_runtime_upgrade_progress(&app_for_progress, self);
         };
 
         use crate::tool_manager::UpgradeOutcome;
@@ -1049,8 +1062,6 @@ impl AppState {
                     p.overall_percent = 100;
                 });
                 emit_runtime_upgrade_progress(app, self);
-                *self.runtime_upgrade_in_progress.lock() = false;
-                self.invalidate_runtime_status_cache();
                 return;
             }
             Ok(tail) => tail,
@@ -1108,9 +1119,7 @@ impl AppState {
             BootValidationOutcome::NotStarted
         } else {
             let app_for_progress = app.clone();
-            let self_ptr_progress: *const AppState = self as *const AppState;
             self.wait_for_boot_validation(move |elapsed, active| {
-                let state_ref = unsafe { &*self_ptr_progress };
                 let elapsed_secs = elapsed.as_secs();
                 let message = boot_validation_message(elapsed_secs, active);
                 // Gently creep 97 → 99.5 over the max budget so the bar keeps
@@ -1119,11 +1128,11 @@ impl AppState {
                     + ((elapsed_secs as u128 * 250 / RUNTIME_UPGRADE_BOOT_MAX_SECS as u128).min(250)
                         as u8)
                         / 100;
-                state_ref.set_upgrade_progress(|p| {
+                self.set_upgrade_progress(|p| {
                     p.message = message;
                     p.overall_percent = percent.min(99);
                 });
-                emit_runtime_upgrade_progress(&app_for_progress, state_ref);
+                emit_runtime_upgrade_progress(&app_for_progress, self);
             })
         };
         let boot_ok = outcome.is_ok();
@@ -1190,8 +1199,6 @@ impl AppState {
                 );
                 self.stop_headroom();
             }
-            *self.runtime_upgrade_in_progress.lock() = false;
-            self.invalidate_runtime_status_cache();
             return;
         }
 
@@ -1381,8 +1388,6 @@ impl AppState {
             p.overall_percent = 100;
         });
         emit_runtime_upgrade_progress(app, self);
-        *self.runtime_upgrade_in_progress.lock() = false;
-        self.invalidate_runtime_status_cache();
     }
 
     /// User-initiated retry of a previously-failed runtime upgrade. Resets
@@ -1935,14 +1940,20 @@ impl AppState {
         // re-fetch from the proxy. 12s gives at least one cache hit between
         // dashboard refreshes while keeping session savings visibly fresh.
         const TTL: Duration = Duration::from_secs(12);
-        let mut cache = self.cached_headroom_stats.lock();
-        if let Some((stats, at)) = cache.as_ref() {
-            if at.elapsed() < TTL {
-                return stats.clone();
+        {
+            let cache = self.cached_headroom_stats.lock();
+            if let Some((stats, at)) = cache.as_ref() {
+                if at.elapsed() < TTL {
+                    return stats.clone();
+                }
             }
         }
+        // Fetch with the guard dropped: holding it across the network call
+        // (readyz probe + stats request, several seconds when the proxy is
+        // down) serialized every concurrent dashboard builder behind one
+        // stalled fetch. A rare duplicate fetch is cheaper than that.
         let stats = fetch_headroom_dashboard_stats();
-        *cache = Some((stats.clone(), Instant::now()));
+        *self.cached_headroom_stats.lock() = Some((stats.clone(), Instant::now()));
         stats
     }
 
@@ -1957,16 +1968,20 @@ impl AppState {
         // chart resolves/recovers within a few seconds, instead of holding the
         // startup loading state or stale data for a full 30s.
         const MISS_TTL: Duration = Duration::from_secs(3);
-        let mut cache = self.cached_headroom_history.lock();
-        if let Some((history, at, fresh)) = cache.as_ref() {
-            let ttl = if *fresh { TTL } else { MISS_TTL };
-            if at.elapsed() < ttl {
-                return history.clone();
+        {
+            let cache = self.cached_headroom_history.lock();
+            if let Some((history, at, fresh)) = cache.as_ref() {
+                let ttl = if *fresh { TTL } else { MISS_TTL };
+                if at.elapsed() < ttl {
+                    return history.clone();
+                }
             }
         }
+        // Guard dropped across the fetch — see cached_headroom_stats.
         match fetch_headroom_savings_history() {
             Some(history) => {
-                *cache = Some((Some(history.clone()), Instant::now(), true));
+                *self.cached_headroom_history.lock() =
+                    Some((Some(history.clone()), Instant::now(), true));
                 Some(history)
             }
             None => {
@@ -1974,6 +1989,7 @@ impl AppState {
                 // doesn't revert the Home chart to the sparse tracker-only
                 // layer. Mark it stale so we re-probe on the short miss TTL and
                 // recover quickly once the proxy returns.
+                let mut cache = self.cached_headroom_history.lock();
                 let retained = cache.as_ref().and_then(|(h, _, _)| h.clone());
                 *cache = Some((retained.clone(), Instant::now(), false));
                 retained
