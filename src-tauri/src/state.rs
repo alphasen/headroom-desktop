@@ -2171,17 +2171,16 @@ impl AppState {
             }
         }
 
-        let output_reduction =
-            stats
-                .as_ref()
-                .and_then(|s| s.output_reduction.as_ref())
-                .map(|o| crate::models::OutputReduction {
-                    method: o.method.clone(),
-                    reduction_percent: o.reduction_percent,
-                    ci_low_percent: o.ci_low_percent,
-                    ci_high_percent: o.ci_high_percent,
-                    requests: o.requests,
-                });
+        let output_reduction = stats
+            .as_ref()
+            .and_then(|s| s.output_reduction.as_ref())
+            .map(|o| crate::models::OutputReduction {
+                method: o.method.clone(),
+                reduction_percent: o.reduction_percent,
+                ci_low_percent: o.ci_low_percent,
+                ci_high_percent: o.ci_high_percent,
+                requests: o.requests,
+            });
 
         if let Some(history) = history.as_ref() {
             let cutoff_date = savings_history_cutoff_date();
@@ -3072,8 +3071,7 @@ impl AppState {
         codex_keep_alive: bool,
     ) {
         use std::sync::atomic::Ordering::{Acquire, Release};
-        let was_bypassed =
-            self.proxy_bypass.load(Acquire) || self.claude_only_bypass.load(Acquire);
+        let was_bypassed = self.proxy_bypass.load(Acquire) || self.claude_only_bypass.load(Acquire);
         let should_bypass = !status.optimization_allowed;
 
         if should_bypass {
@@ -3477,26 +3475,42 @@ fn persist_launch_profile(path: &std::path::Path, profile: &LaunchProfile) {
 }
 
 impl LaunchProfile {
+    fn fresh() -> Self {
+        LaunchProfile {
+            launch_count: 0,
+            launch_experience: LaunchExperience::FirstRun,
+            lifetime_requests: 0,
+            lifetime_estimated_savings_usd: 0.0,
+            lifetime_estimated_tokens_saved: 0,
+            setup_wizard_complete: false,
+            last_launched_app_version: None,
+            last_runtime_upgrade_failure: None,
+            accepted_terms_version: 0,
+        }
+    }
+
     fn load_or_create(base_dir: &std::path::Path) -> Result<(Self, std::path::PathBuf)> {
         let path = config_file(base_dir, "launch-profile.json");
 
+        // A corrupt or truncated profile (0-byte file from a crash mid-write,
+        // RUST-1P) must not crash startup — that's an unrecoverable launch
+        // loop until the user manually deletes the file. Degrade to a fresh
+        // profile; the warn still reaches Sentry for visibility.
         let previous = if path.exists() {
-            let bytes =
-                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-            serde_json::from_slice::<LaunchProfile>(&bytes)
-                .with_context(|| format!("parsing {}", path.display()))?
+            std::fs::read(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|bytes| {
+                    serde_json::from_slice::<LaunchProfile>(&bytes).map_err(anyhow::Error::from)
+                })
+                .unwrap_or_else(|err| {
+                    log::warn!(
+                        "launch profile at {} unreadable ({err}); starting fresh",
+                        path.display()
+                    );
+                    Self::fresh()
+                })
         } else {
-            LaunchProfile {
-                launch_count: 0,
-                launch_experience: LaunchExperience::FirstRun,
-                lifetime_requests: 0,
-                lifetime_estimated_savings_usd: 0.0,
-                lifetime_estimated_tokens_saved: 0,
-                setup_wizard_complete: false,
-                last_launched_app_version: None,
-                last_runtime_upgrade_failure: None,
-                accepted_terms_version: 0,
-            }
+            Self::fresh()
         };
 
         let mut current = previous;
@@ -3865,10 +3879,8 @@ impl SavingsTracker {
         if total <= self.lifetime_token_milestone_high_water {
             return Vec::new();
         }
-        let crossed = lifetime_token_milestones_crossed(
-            self.lifetime_token_milestone_high_water,
-            total,
-        );
+        let crossed =
+            lifetime_token_milestones_crossed(self.lifetime_token_milestone_high_water, total);
         self.lifetime_token_milestone_high_water = total;
         crossed
     }
@@ -4559,7 +4571,11 @@ fn parse_output_reduction(root: &Value) -> Option<OutputReduction> {
     let node = value_at_path(root, &["savings", "by_layer", "output_shaping"])
         .or_else(|| value_at_path(root, &["tokens", "output_reduction"]))?;
 
-    if !node.get("available").and_then(Value::as_bool).unwrap_or(false) {
+    if !node
+        .get("available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         return None;
     }
 
@@ -5475,7 +5491,10 @@ fn is_headroom_proxy_reachable() -> bool {
 }
 
 fn probe_proxy_readyz(timeout: Duration) -> bool {
-    let client = match reqwest::blocking::Client::builder().timeout(timeout).build() {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+    {
         Ok(client) => client,
         Err(_) => return false,
     };
@@ -5538,8 +5557,10 @@ fn merge_daily_savings(
     use std::collections::BTreeMap;
     // Index the local tracker by date so a desynced history point can fall back
     // to it (see the zero-spend guard below).
-    let tracker_by_date: BTreeMap<String, DailySavingsPoint> =
-        tracker.iter().map(|p| (p.date.clone(), p.clone())).collect();
+    let tracker_by_date: BTreeMap<String, DailySavingsPoint> = tracker
+        .iter()
+        .map(|p| (p.date.clone(), p.clone()))
+        .collect();
 
     let mut by_date: BTreeMap<String, DailySavingsPoint> = BTreeMap::new();
     // Post-cutoff: history wins, tracker fills gaps so today's local activity still shows.
@@ -5551,8 +5572,9 @@ fn merge_daily_savings(
             // desync that self-heals; see RUST-3S/3V). When that happens and the
             // local tracker recorded real spend that day, prefer the tracker point
             // rather than surfacing a savings-with-zero-spend day.
-            let history_desynced =
-                p.estimated_savings_usd > 0.000_001 && p.actual_cost_usd == 0.0 && p.total_tokens_sent == 0;
+            let history_desynced = p.estimated_savings_usd > 0.000_001
+                && p.actual_cost_usd == 0.0
+                && p.total_tokens_sent == 0;
             if history_desynced {
                 if let Some(t) = tracker_by_date.get(p.date.as_str()) {
                     if t.total_tokens_sent > 0 {
@@ -5690,13 +5712,13 @@ mod tests {
         aggregate_weekly_totals, apply_bootstrap_step, begin_bootstrap_transition,
         boot_validation_stalled, bootstrap_complete_state, bootstrap_failed_state,
         classify_startup_error, cpu_time_advanced, hf_cache_grew,
-        lifetime_token_milestones_crossed, log_mtime_advanced,
-        merge_daily_savings, merge_hourly_savings, most_recent_monday,
-        parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
+        lifetime_token_milestones_crossed, log_mtime_advanced, merge_daily_savings,
+        merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
+        parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_status_is_reachable, tcp_port_accepts_connection, total_dir_size_bytes,
-        AppState, BootValidationOutcome,
-        ClaudeProjectScan, DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
-        PersistedSavingsState, SavingsObservation, SavingsTracker,
+        AppState, BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket,
+        HeadroomDashboardStats, HeadroomSavingsHistoryPoint, PersistedSavingsState,
+        SavingsObservation, SavingsTracker,
     };
 
     #[test]
@@ -6011,7 +6033,10 @@ mod tests {
             File registry.py, line 11\n    from headroom.providers.claude import DEFAULT_API_URL\n\
             ModuleNotFoundError: No module named 'headroom.providers.claude'\n--- end log ---";
         let hint = classify_startup_error(raw).expect("missing module should classify");
-        assert!(hint.contains("missing some of its own files"), "got: {hint}");
+        assert!(
+            hint.contains("missing some of its own files"),
+            "got: {hint}"
+        );
         assert!(hint.contains("Reinstall"));
         // Must win over the generic crash branch (which also matches this raw).
         assert!(!hint.contains("crashed at startup"), "got: {hint}");
@@ -6257,15 +6282,24 @@ mod tests {
         let mut tracker = make_tracker();
         // First crossing past 100k fires; staying flat or dipping fires nothing.
         assert_eq!(tracker.note_lifetime_token_total(150_000), vec![100_000]);
-        assert_eq!(tracker.note_lifetime_token_total(120_000), Vec::<u64>::new());
-        assert_eq!(tracker.note_lifetime_token_total(150_000), Vec::<u64>::new());
+        assert_eq!(
+            tracker.note_lifetime_token_total(120_000),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            tracker.note_lifetime_token_total(150_000),
+            Vec::<u64>::new()
+        );
         // Advancing past the next thresholds fires each crossed milestone once.
         assert_eq!(
             tracker.note_lifetime_token_total(5_500_000),
             vec![1_000_000, 5_000_000]
         );
         // Repeating 10M-step milestones fire as the total climbs past them.
-        assert_eq!(tracker.note_lifetime_token_total(21_000_000), vec![10_000_000, 20_000_000]);
+        assert_eq!(
+            tracker.note_lifetime_token_total(21_000_000),
+            vec![10_000_000, 20_000_000]
+        );
     }
 
     #[test]
@@ -6902,12 +6936,10 @@ mod tests {
                 history_point_at(2026, 3, 20, 12, 1_500_000),
             ],
         };
-        *state.cached_headroom_stats.lock() =
-            Some((Some(stats), std::time::Instant::now()));
+        *state.cached_headroom_stats.lock() = Some((Some(stats), std::time::Instant::now()));
         // Pin the history cache to a fresh miss so build_dashboard doesn't try
         // to fetch native rollups over the network during the test.
-        *state.cached_headroom_history.lock() =
-            Some((None, std::time::Instant::now(), true));
+        *state.cached_headroom_history.lock() = Some((None, std::time::Instant::now(), true));
 
         // Read-only path observes (building buckets) but must not surface or
         // consume milestones.
@@ -8044,6 +8076,29 @@ mod tests {
     }
 
     #[test]
+    fn launch_profile_load_or_create_survives_corrupt_file() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "headroom-launch-profile-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        ensure_data_dirs(&base_dir).expect("create temp dirs");
+        let path = crate::storage::config_file(&base_dir, "launch-profile.json");
+        std::fs::write(&path, "").expect("write empty profile"); // RUST-1P: 0-byte file
+
+        let (profile, _) = super::LaunchProfile::load_or_create(&base_dir)
+            .expect("must not fail on corrupt profile");
+        assert_eq!(profile.launch_count, 1);
+        assert!(matches!(
+            profile.launch_experience,
+            crate::models::LaunchExperience::FirstRun
+        ));
+        // The rewritten file parses again on the next launch.
+        let (profile, _) = super::LaunchProfile::load_or_create(&base_dir).expect("reload");
+        assert_eq!(profile.launch_count, 2);
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
     fn load_or_create_ignores_old_persisted_snapshot_schema() {
         let base_dir = std::env::temp_dir().join(format!(
             "headroom-savings-state-test-{}",
@@ -8321,7 +8376,7 @@ mod tests {
 
         // First observation: 1_000 tokens saved, history shows 0→1_000 across hours 9→10.
         tracker.observe(&HeadroomDashboardStats {
-                output_reduction: None,
+            output_reduction: None,
             session_requests: Some(1),
             session_estimated_savings_usd: Some(1.0),
             session_estimated_tokens_saved: Some(1_000),
@@ -8338,7 +8393,7 @@ mod tests {
 
         // Second observation: 3_000 tokens saved, history adds hour 11.
         tracker.observe(&HeadroomDashboardStats {
-                output_reduction: None,
+            output_reduction: None,
             session_requests: Some(3),
             session_estimated_savings_usd: Some(3.0),
             session_estimated_tokens_saved: Some(3_000),

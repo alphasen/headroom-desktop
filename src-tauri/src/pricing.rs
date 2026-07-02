@@ -994,25 +994,37 @@ pub fn weekly_limit_signal(status: &HeadroomPricingStatus) -> Option<WeeklyLimit
             Some(PricingGateReason::WeeklyUsageLimitReached)
         );
     if claude_reached {
-        return Some(WeeklyLimitNudge { status: "reached", cap_percent: claude_cap });
+        return Some(WeeklyLimitNudge {
+            status: "reached",
+            cap_percent: claude_cap,
+        });
     }
     let codex_reached = status
         .codex
         .as_ref()
         .is_some_and(|codex| !codex.optimization_allowed);
     if codex_reached {
-        return Some(WeeklyLimitNudge { status: "reached", cap_percent: codex_cap });
+        return Some(WeeklyLimitNudge {
+            status: "reached",
+            cap_percent: codex_cap,
+        });
     }
 
     if status.should_nudge {
-        return Some(WeeklyLimitNudge { status: "approaching", cap_percent: claude_cap });
+        return Some(WeeklyLimitNudge {
+            status: "approaching",
+            cap_percent: claude_cap,
+        });
     }
     let codex_approaching = status
         .codex
         .as_ref()
         .is_some_and(|codex| codex.should_nudge);
     if codex_approaching {
-        return Some(WeeklyLimitNudge { status: "approaching", cap_percent: codex_cap });
+        return Some(WeeklyLimitNudge {
+            status: "approaching",
+            cap_percent: codex_cap,
+        });
     }
     None
 }
@@ -1330,8 +1342,7 @@ fn evaluate_pricing_status_with_mismatch(
                     "Headroom subscription active. Optimization stays fully enabled.".into();
             }
         } else if account.trial_active {
-            gate_message =
-                "Your Headroom trial is active with unlimited optimization.".into();
+            gate_message = "Your Headroom trial is active with unlimited optimization.".into();
         } else {
             match claude.plan_tier {
                 ClaudePlanTier::Free => {
@@ -4505,14 +4516,12 @@ mod tests {
         );
         // Unknown is undecodable, not a confident plan -> no recommendation, so
         // a Pro subscriber with no other signal sees no mismatch nudge.
-        assert!(
-            detect_tier_mismatch(
-                &account,
-                &empty_claude_profile(ClaudePlanTier::Unknown),
-                None,
-            )
-            .is_none()
-        );
+        assert!(detect_tier_mismatch(
+            &account,
+            &empty_claude_profile(ClaudePlanTier::Unknown),
+            None,
+        )
+        .is_none());
     }
 
     #[test]

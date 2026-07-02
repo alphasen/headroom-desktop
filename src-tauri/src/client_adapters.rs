@@ -132,8 +132,12 @@ fn build_rtk_codex_nudge(managed_rtk_path: &Path) -> String {
         "## Token-saving shell commands (Headroom RTK)\n\
          Run shell commands through RTK to get compact, token-optimized output:\n\
          prefix the command with `{bin} ` (for example `{bin} git status`,\n\
-         `{bin} ls -la`, `{bin} cargo build`). RTK passes through anything it\n\
-         does not optimize, so it is safe to use as a prefix for any command."
+         `{bin} ls -la`, `{bin} cargo build`). RTK compacts output, so do NOT\n\
+         use it when you need verbatim text: reading or grepping code you are\n\
+         about to edit or patch (RTK grep strips indentation and truncates long\n\
+         lines), or `git diff --check` (RTK drops its whitespace report). Run\n\
+         those raw. Everything else (status, logs, builds, tests, listings) is\n\
+         safe to prefix."
     )
 }
 
@@ -463,13 +467,11 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             }
 
             if codex_guard_hook_path().exists() && codex_guard_registered()? {
-                checks.push(
-                    "Found Headroom routing guard registered in ~/.codex/hooks.json.".into(),
-                );
+                checks
+                    .push("Found Headroom routing guard registered in ~/.codex/hooks.json.".into());
             } else {
-                failures.push(
-                    "Headroom routing guard was not found in ~/.codex/hooks.json.".into(),
-                );
+                failures
+                    .push("Headroom routing guard was not found in ~/.codex/hooks.json.".into());
             }
 
             // Independent confirmation from Codex itself, run off-thread: the
@@ -856,8 +858,11 @@ fn remove_pre_tool_use_markers(settings_path: &Path, markers: &[&str]) -> Result
         .and_then(|value| value.as_array_mut())
     {
         let before = pre_tool_use.len();
-        pre_tool_use
-            .retain(|entry| !markers.iter().any(|marker| entry_contains_hook(entry, marker)));
+        pre_tool_use.retain(|entry| {
+            !markers
+                .iter()
+                .any(|marker| entry_contains_hook(entry, marker))
+        });
         if pre_tool_use.len() != before {
             changed = true;
         }
@@ -1703,12 +1708,26 @@ fn entry_contains_hook(entry: &Value, hook_fragment: &str) -> bool {
         .map(|hooks| {
             hooks.iter().any(|hook| {
                 hook.get("command")
-                    .and_then(|command| command.as_str())
-                    .map(|command| command.contains(hook_fragment))
-                    .unwrap_or(false)
+                    .is_some_and(|c| command_contains(c, hook_fragment))
             })
         })
         .unwrap_or(false)
+}
+
+/// Match a hook `command` against a fragment, tolerating both the Claude string
+/// form (`"/usr/bin/python3 /path/guard.py"`) and the argv-array form Codex
+/// normalizes to (`["python3", "/path/guard.py"]`). Callers pass the guard
+/// *script path* as the fragment so a differing interpreter (system vs Homebrew
+/// python3) can't leave the entry behind when the script is deleted.
+fn command_contains(command: &Value, fragment: &str) -> bool {
+    match command {
+        Value::String(s) => s.contains(fragment),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|p| p.contains(fragment)),
+        _ => false,
+    }
 }
 
 fn remove_legacy_vscode_base_url_keys() -> Result<(Vec<String>, Vec<String>)> {
@@ -1820,7 +1839,10 @@ fn codex_sqlite_store_expected() -> bool {
 /// Anything else -> `None`.
 fn codex_store_version(path: &Path) -> Option<u32> {
     let name = path.file_name()?.to_str()?;
-    name.strip_prefix("state_")?.strip_suffix(".sqlite")?.parse().ok()
+    name.strip_prefix("state_")?
+        .strip_suffix(".sqlite")?
+        .parse()
+        .ok()
 }
 
 /// Discover every `state_<N>.sqlite` store under the known Codex dirs, with the
@@ -2033,7 +2055,9 @@ fn strip_marker_block(content: &str, block_id: &str) -> String {
         if end_idx < start_idx {
             break; // malformed (stray end before start) — leave it alone
         }
-        let tail = out[end_idx + end.len()..].trim_start_matches('\n').to_string();
+        let tail = out[end_idx + end.len()..]
+            .trim_start_matches('\n')
+            .to_string();
         let head = out[..start_idx].trim_end().to_string();
         let mut rebuilt = String::with_capacity(out.len());
         rebuilt.push_str(&head);
@@ -2110,7 +2134,15 @@ pub fn pin_codex_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
     let content =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
 
-    let target_line = format!("command = {}", toml_basic_string(&entrypoint.to_string_lossy()));
+    let target_line = format!(
+        "command = {}",
+        toml_basic_string(&entrypoint.to_string_lossy())
+    );
+    // The upstream registrar may resolve the server as `<python> -m headroom.cli
+    // mcp serve`. Pinning only `command` to the console script would leave
+    // `args = ["-m", "headroom.cli", ...]` behind, and `headroom -m ...` fails
+    // with "No such option '-m'" — so the args must be pinned together.
+    let target_args_line = r#"args = ["mcp", "serve"]"#;
 
     let mut in_headroom_table = false;
     let mut replaced = false;
@@ -2122,15 +2154,19 @@ pub fn pin_codex_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
             out.push(line.to_string());
             continue;
         }
-        if in_headroom_table
-            && !replaced
-            && trimmed
-                .split_once('=')
-                .is_some_and(|(key, _)| key.trim() == "command")
-        {
-            out.push(target_line.clone());
-            replaced = true;
-            continue;
+        if in_headroom_table {
+            match trimmed.split_once('=').map(|(key, _)| key.trim()) {
+                Some("command") => {
+                    out.push(target_line.clone());
+                    replaced = true;
+                    continue;
+                }
+                Some("args") => {
+                    out.push(target_args_line.to_string());
+                    continue;
+                }
+                _ => {}
+            }
         }
         out.push(line.to_string());
     }
@@ -2415,7 +2451,10 @@ fn register_guard_hook_entries(
             .get_mut(event)
             .and_then(Value::as_array_mut)
             .ok_or_else(|| anyhow!("unable to write hooks settings"))?;
-        if entries.iter().any(|entry| entry_contains_hook(entry, command)) {
+        if entries
+            .iter()
+            .any(|entry| entry_contains_hook(entry, command))
+        {
             continue;
         }
         let handler = serde_json::json!({
@@ -2481,7 +2520,11 @@ fn guard_registered_in_hooks(hooks_path: &Path, command: &str) -> Result<bool> {
 /// user-authored hooks intact and drops now-empty event arrays. `delete_if_empty`
 /// removes the whole file when nothing remains -- correct for Codex's standalone
 /// `hooks.json`, but never for Claude's shared `settings.json`.
-fn remove_guard_hook_entries(hooks_path: &Path, command: &str, delete_if_empty: bool) -> Result<()> {
+fn remove_guard_hook_entries(
+    hooks_path: &Path,
+    command: &str,
+    delete_if_empty: bool,
+) -> Result<()> {
     if !hooks_path.exists() {
         return Ok(());
     }
@@ -2491,8 +2534,11 @@ fn remove_guard_hook_entries(hooks_path: &Path, command: &str, delete_if_empty: 
     let mut changed = false;
     let mut hooks_empty = false;
     if let Some(hooks_obj) = content.get_mut("hooks").and_then(Value::as_object_mut) {
-        for event in ["SessionStart", "UserPromptSubmit"] {
-            if let Some(entries) = hooks_obj.get_mut(event).and_then(Value::as_array_mut) {
+        // Sweep every event, not just the two we register, so a guard that Codex
+        // (or an older build) moved to another event is still stripped.
+        let events: Vec<String> = hooks_obj.keys().cloned().collect();
+        for event in events {
+            if let Some(entries) = hooks_obj.get_mut(&event).and_then(Value::as_array_mut) {
                 let before = entries.len();
                 entries.retain(|entry| !entry_contains_hook(entry, command));
                 if entries.len() != before {
@@ -2552,8 +2598,15 @@ fn codex_guard_registered() -> Result<bool> {
 }
 
 fn remove_codex_guard_hook() -> Result<()> {
-    remove_guard_hook_entries(&codex_hooks_json_path(), &codex_guard_command(), true)?;
     let script_path = codex_guard_hook_path();
+    // Match on the script path, not the full `/usr/bin/python3 <path>` command,
+    // so the registration is stripped even if the interpreter differs -- otherwise
+    // deleting the script below leaves a dangling hook that fails with ENOENT.
+    remove_guard_hook_entries(
+        &codex_hooks_json_path(),
+        &script_path.display().to_string(),
+        true,
+    )?;
     if script_path.exists() {
         let _ = std::fs::remove_file(&script_path);
     }
@@ -2709,11 +2762,12 @@ fn claude_guard_registered() -> Result<bool> {
 /// Never deletes settings.json (it carries other keys), so `delete_if_empty` is
 /// false.
 fn remove_claude_guard_hook() -> Result<()> {
-    let command = claude_guard_command();
-    for settings_path in claude_settings_candidates() {
-        let _ = remove_guard_hook_entries(&settings_path, &command, false);
-    }
     let script_path = claude_guard_hook_path();
+    // Match on the script path, not the full interpreter command (see codex counterpart).
+    let fragment = script_path.display().to_string();
+    for settings_path in claude_settings_candidates() {
+        let _ = remove_guard_hook_entries(&settings_path, &fragment, false);
+    }
     if script_path.exists() {
         let _ = std::fs::remove_file(&script_path);
     }
@@ -3401,6 +3455,12 @@ if [ -z "$CMD" ]; then
   exit 0
 fi
 
+# `rtk git diff --check` swallows the whitespace-error report the flag exists to
+# produce (only the exit code survives), so any --check command must stay raw.
+case " $CMD " in
+  *" --check "*) exit 0 ;;
+esac
+
 REWRITTEN="$("$HEADROOM_RTK" rewrite "$CMD" 2>/dev/null || true)"
 if [ -z "$REWRITTEN" ] || [ "$CMD" = "$REWRITTEN" ]; then
   exit 0
@@ -3766,20 +3826,18 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        build_claude_guard_script, build_codex_guard_script,
-        build_headroom_markitdown_hook, build_markitdown_codex_nudge, build_markitdown_office_nudge,
-        build_headroom_rtk_hook, claude_code_user_state_exists,
-        claude_hook_present_in_value, remove_pre_tool_use_markers,
-        default_shell_targets_for_family, entry_contains_hook, find_on_path_entries,
-        normalize_setup_state, normalized_setup_id, nvm_binary_candidates, parse_json_object,
-        codex_home, codex_sqlite_store_expected, codex_store_version,
-        discover_codex_state_dbs, remove_managed_block,
-        retag_codex_thread_providers, retag_codex_threads_to_headroom, retag_one_codex_db,
-        is_permission_denied, oss_remnant_warnings, pin_codex_mcp_command, render_codex_config,
-        serialize_paths,
-        shell_block_contains_in_files,
-        shell_block_contains_text_in_files, shell_double_quote, strip_headroom_hook_from_settings,
-        upsert_managed_block, write_file_if_changed, ClientSetupState, ShellFamily,
+        build_claude_guard_script, build_codex_guard_script, build_headroom_markitdown_hook,
+        build_headroom_rtk_hook, build_markitdown_codex_nudge, build_markitdown_office_nudge,
+        claude_code_user_state_exists, claude_hook_present_in_value, codex_home,
+        codex_sqlite_store_expected, codex_store_version, default_shell_targets_for_family,
+        discover_codex_state_dbs, entry_contains_hook, find_on_path_entries, is_permission_denied,
+        normalize_setup_state, normalized_setup_id, nvm_binary_candidates, oss_remnant_warnings,
+        parse_json_object, pin_codex_mcp_command, remove_managed_block,
+        remove_pre_tool_use_markers, render_codex_config, retag_codex_thread_providers,
+        retag_codex_threads_to_headroom, retag_one_codex_db, serialize_paths,
+        shell_block_contains_in_files, shell_block_contains_text_in_files, shell_double_quote,
+        strip_headroom_hook_from_settings, upsert_managed_block, write_file_if_changed,
+        ClientSetupState, ShellFamily,
     };
     use rusqlite::Connection;
 
@@ -3963,8 +4021,8 @@ mod tests {
         )
         .expect("write settings");
 
-        let changed =
-            remove_pre_tool_use_markers(&settings, &["headroom-markitdown-read.sh"]).expect("strip");
+        let changed = remove_pre_tool_use_markers(&settings, &["headroom-markitdown-read.sh"])
+            .expect("strip");
         assert!(changed);
 
         let after: serde_json::Value =
@@ -4494,6 +4552,65 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    fn hook_script_passes_through_check_commands() {
+        // `rtk git diff --check` swallows the whitespace report; the hook must
+        // leave any --check command unrewritten even when rtk would rewrite it.
+        let root = unique_temp_dir("headroom-hook-check");
+        fs::create_dir_all(&root).expect("create root");
+
+        let fake_rtk = root.join("fake-rtk");
+        fs::write(
+            &fake_rtk,
+            "#!/usr/bin/env bash\nshift\necho \"/bin/echo $*\"\n",
+        )
+        .expect("write fake rtk");
+        fs::set_permissions(
+            &fake_rtk,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("chmod rtk");
+
+        let system_python = PathBuf::from("/usr/bin/python3");
+        let hook_body = build_headroom_rtk_hook(&fake_rtk, &system_python);
+        let hook_path = root.join("hook.sh");
+        fs::write(&hook_path, &hook_body).expect("write hook");
+        fs::set_permissions(
+            &hook_path,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("chmod hook");
+
+        for cmd in ["git diff --cached --check", "git diff --check"] {
+            let stdin = format!(r#"{{"tool_input":{{"command":"{cmd}"}}}}"#);
+            let output = std::process::Command::new("bash")
+                .arg(&hook_path)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write;
+                    child
+                        .stdin
+                        .as_mut()
+                        .unwrap()
+                        .write_all(stdin.as_bytes())
+                        .unwrap();
+                    child.wait_with_output()
+                })
+                .expect("run hook");
+            assert!(output.status.success(), "hook should exit 0 for {cmd}");
+            assert!(
+                output.stdout.is_empty(),
+                "hook must not rewrite {cmd}, got: {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn hook_script_emits_rewrite_when_first_token_is_valid_absolute_path() {
         let root = unique_temp_dir("headroom-hook-bash-ok");
         fs::create_dir_all(&root).expect("create root");
@@ -4707,10 +4824,18 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         prev_xdg: Option<std::ffi::OsString>,
         prev_shell: Option<std::ffi::OsString>,
         prev_codex: Option<std::ffi::OsString>,
+        // Held for the guard's lifetime: env vars are process-global, so two
+        // TestHome tests running on parallel threads corrupt each other's HOME
+        // (and can leak writes into the developer's real profile). serial_test
+        // only covers tests that opted in; this lock covers every TestHome user.
+        _env_lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl TestHome {
         fn new() -> Self {
+            let env_lock = crate::test_env_lock::HOME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let tmp = tempfile::tempdir().expect("create temp home");
             let home = tmp.path().to_path_buf();
             let prev_home = std::env::var_os("HOME");
@@ -4736,6 +4861,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 prev_xdg,
                 prev_shell,
                 prev_codex,
+                _env_lock: env_lock,
             }
         }
 
@@ -4886,7 +5012,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&script).unwrap().permissions().mode();
-            assert!(mode & 0o111 != 0, "guard script is executable, got {mode:o}");
+            assert!(
+                mode & 0o111 != 0,
+                "guard script is executable, got {mode:o}"
+            );
         }
 
         let settings_path = home.path().join(".claude").join("settings.json");
@@ -4906,7 +5035,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                         .any(|h| h["command"] == serde_json::Value::String(command.clone()))
                 })
                 .count();
-            assert_eq!(count, 1, "guard registered once for {event}, got:\n{settings:#}");
+            assert_eq!(
+                count, 1,
+                "guard registered once for {event}, got:\n{settings:#}"
+            );
         }
         assert_eq!(
             settings["hooks"]["SessionStart"][0]["matcher"],
@@ -4996,7 +5128,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "RTK binary must be absent for this test"
         );
         let state = super::load_setup_state();
-        assert!(!state.rtk_disabled, "rtk_disabled stays false when untoggled");
+        assert!(
+            !state.rtk_disabled,
+            "rtk_disabled stays false when untoggled"
+        );
 
         let verification =
             super::verify_client_setup("claude_code").expect("verify_client_setup succeeds");
@@ -5040,7 +5175,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         let agents = home.path().join(".codex").join("AGENTS.md");
         let body = fs::read_to_string(&agents).expect("AGENTS.md written");
-        assert!(body.contains("Headroom RTK"), "nudge heading present: {body}");
+        assert!(
+            body.contains("Headroom RTK"),
+            "nudge heading present: {body}"
+        );
         assert!(
             body.contains(&rtk.display().to_string()),
             "nudge references the managed rtk path: {body}"
@@ -5295,7 +5433,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&script).unwrap().permissions().mode();
-            assert!(mode & 0o111 != 0, "guard script is executable, got {mode:o}");
+            assert!(
+                mode & 0o111 != 0,
+                "guard script is executable, got {mode:o}"
+            );
         }
 
         let hooks: serde_json::Value =
@@ -5316,7 +5457,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             assert!(registered, "guard registered for {event}, got:\n{hooks:#}");
         }
         // SessionStart carries the lifecycle matcher; UserPromptSubmit does not.
-        assert_eq!(hooks["hooks"]["SessionStart"][0]["matcher"], "startup|resume|clear|compact");
+        assert_eq!(
+            hooks["hooks"]["SessionStart"][0]["matcher"],
+            "startup|resume|clear|compact"
+        );
     }
 
     #[test]
@@ -5351,7 +5495,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 })
             })
             .count();
-        assert_eq!(guard_count, 1, "guard registered exactly once, got:\n{hooks:#}");
+        assert_eq!(
+            guard_count, 1,
+            "guard registered exactly once, got:\n{hooks:#}"
+        );
 
         super::disable_client_setup("codex").expect("disable");
 
@@ -5370,6 +5517,40 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             after_str.contains("echo mine"),
             "user-authored hook preserved, got:\n{after:#}"
+        );
+    }
+
+    #[test]
+    fn remove_guard_hook_entries_strips_stale_interpreter_and_argv_forms() {
+        // Regression: an entry written by another build (different interpreter) or
+        // normalized by Codex into argv-array form under an unregistered event must
+        // still be stripped -- otherwise deleting the script leaves a dangling hook.
+        let home = TestHome::new();
+        let hooks_path = home.path().join("hooks.json");
+        let script = "/Users/x/.codex/hooks/headroom-codex-guard.py";
+        fs::write(
+            &hooks_path,
+            format!(
+                r#"{{"hooks":{{
+                    "SessionStart":[{{"hooks":[{{"type":"command","command":"/opt/homebrew/bin/python3 {script}"}}]}}],
+                    "SessionEnd":[{{"hooks":[{{"type":"command","command":["python3","{script}"]}}]}}],
+                    "UserPromptSubmit":[{{"hooks":[{{"type":"command","command":"echo mine"}}]}}]
+                }}}}"#
+            ),
+        )
+        .unwrap();
+
+        super::remove_guard_hook_entries(&hooks_path, script, true).unwrap();
+
+        let after = read_settings_json(&hooks_path);
+        let after_str = serde_json::to_string(&after).unwrap();
+        assert!(
+            !after_str.contains("headroom-codex-guard.py"),
+            "stale guard forms stripped, got:\n{after:#}"
+        );
+        assert!(
+            after_str.contains("echo mine"),
+            "user hook preserved, got:\n{after:#}"
         );
     }
 
@@ -5784,7 +5965,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     fn codex_store_version_parses_state_filename() {
         assert_eq!(codex_store_version(Path::new("/x/state_5.sqlite")), Some(5));
-        assert_eq!(codex_store_version(Path::new("/x/state_42.sqlite")), Some(42));
+        assert_eq!(
+            codex_store_version(Path::new("/x/state_42.sqlite")),
+            Some(42)
+        );
         assert_eq!(codex_store_version(Path::new("/x/config.toml")), None);
         assert_eq!(codex_store_version(Path::new("/x/state_.sqlite")), None);
         assert_eq!(codex_store_version(Path::new("/x/state_x.sqlite")), None);
@@ -5846,6 +6030,38 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         // Idempotent: a second run with the same entrypoint is a no-op.
         assert!(pin_codex_mcp_command(&entrypoint).unwrap().is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pin_codex_mcp_command_normalizes_python_module_args() {
+        // Upstream may register `<python> -m headroom.cli mcp serve`. Pinning
+        // command to the console script must also rewrite the args, otherwise
+        // `headroom -m headroom.cli ...` fails with "No such option '-m'".
+        let home = TestHome::new();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        let config = codex.join("config.toml");
+        std::fs::write(
+            &config,
+            "[mcp_servers.headroom]\n\
+             command = \"/somewhere/venv/bin/python3\"\n\
+             args = [\"-m\", \"headroom.cli\", \"mcp\", \"serve\"]\n\
+             \n\
+             [mcp_servers.headroom.env]\n\
+             HEADROOM_PROXY_URL = \"http://127.0.0.1:6767\"\n",
+        )
+        .unwrap();
+
+        let entrypoint = home.path().join("venv/bin/headroom");
+        assert!(pin_codex_mcp_command(&entrypoint).unwrap().is_some());
+
+        let after = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            after.contains("args = [\"mcp\", \"serve\"]"),
+            "python -m args must be normalized, got:\n{after}"
+        );
+        assert!(!after.contains("-m"), "no -m leftovers, got:\n{after}");
     }
 
     #[test]

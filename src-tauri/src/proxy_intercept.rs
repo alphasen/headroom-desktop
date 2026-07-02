@@ -348,9 +348,7 @@ async fn handle(
     // response path that sees those headers. Every other client (Claude) keeps
     // the untouched zero-copy splice.
     if is_codex {
-        let req_path = parse_request_head(&buf)
-            .map(|p| p.path)
-            .unwrap_or_default();
+        let req_path = parse_request_head(&buf).map(|p| p.path).unwrap_or_default();
         splice_with_codex_capture(client, backend, &codex_slot, &req_path).await;
     } else {
         let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
@@ -399,11 +397,8 @@ async fn splice_with_codex_capture(
         // path takes the `else` and is byte-for-byte identical to before.
         if let Some(status) = parse_response_status(&head).filter(is_reportable_codex_error) {
             let mut chunk = vec![0u8; MAX_ERROR_BODY];
-            let n = match tokio::time::timeout(
-                ERROR_BODY_READ_TIMEOUT,
-                backend_rd.read(&mut chunk),
-            )
-            .await
+            let n = match tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, backend_rd.read(&mut chunk))
+                .await
             {
                 Ok(Ok(n)) => n,
                 _ => 0,
@@ -1228,8 +1223,8 @@ mod tests {
         bearer_value_changed, codex_snapshot_from_usage_payload, codex_window_label,
         decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
         is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
-        is_openai_path, parse_codex_rate_limit_headers, parse_request_head, read_http_headers,
-        is_reportable_codex_error, parse_response_status, request_has_header,
+        is_openai_path, is_reportable_codex_error, parse_codex_rate_limit_headers,
+        parse_request_head, parse_response_status, read_http_headers, request_has_header,
         request_is_loopback_safe, run, stamp_codex_client_header, strip_request_header, BypassFlag,
         SharedToken,
     };
@@ -1655,7 +1650,10 @@ mod tests {
     fn strip_request_header_removes_lite_header_and_preserves_body() {
         let mut buf = b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nX-OpenAI-Internal-Codex-Responses-Lite: 1\r\nContent-Length: 5\r\n\r\nhello".to_vec();
         strip_request_header(&mut buf, "X-OpenAI-Internal-Codex-Responses-Lite");
-        assert!(!request_has_header(&buf, "X-OpenAI-Internal-Codex-Responses-Lite"));
+        assert!(!request_has_header(
+            &buf,
+            "X-OpenAI-Internal-Codex-Responses-Lite"
+        ));
         // Surrounding headers, terminator and body intact.
         assert!(request_has_header(&buf, "host"));
         assert!(request_has_header(&buf, "content-length"));

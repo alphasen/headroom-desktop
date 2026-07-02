@@ -17,6 +17,16 @@ mod state;
 mod storage;
 mod tool_manager;
 
+/// Cross-module lock for tests that repoint $HOME / $CODEX_HOME. Env vars are
+/// process-global, so home-mutating tests in different modules (client_adapters
+/// TestHome, tool_manager HomeGuard) must serialize on one shared lock or a
+/// guard drop can restore the real HOME mid-test and leak writes into the
+/// developer's real agent configs.
+#[cfg(test)]
+pub(crate) mod test_env_lock {
+    pub(crate) static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -44,8 +54,7 @@ use crate::models::{
     ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus, ClientSetupResult,
     ClientSetupVerification, DailySavingsPoint, DashboardState, HeadroomAuthCodeRequest,
     HeadroomLearnPrereqStatus, HeadroomLearnStatus, HeadroomPricingStatus,
-    HeadroomSubscriptionTier, RuntimeStatus, RuntimeUpgradeProgress,
-    TransformationFeedResponse,
+    HeadroomSubscriptionTier, RuntimeStatus, RuntimeUpgradeProgress, TransformationFeedResponse,
 };
 use crate::state::AppState;
 
@@ -279,7 +288,9 @@ fn maybe_inject_fake_daily_savings(dashboard: &mut DashboardState) {
     let today = Utc::now();
     dashboard.daily_savings = (0..7)
         .map(|i| DailySavingsPoint {
-            date: (today - chrono::Duration::days(i)).format("%Y-%m-%d").to_string(),
+            date: (today - chrono::Duration::days(i))
+                .format("%Y-%m-%d")
+                .to_string(),
             estimated_savings_usd: per_day,
             estimated_tokens_saved: 0,
             actual_cost_usd: 0.0,
@@ -445,8 +456,7 @@ async fn restart_app(app: AppHandle) {
     // unconditionally spawns a NEW instance (bypassing single-instance) — two
     // calls => two app instances running in parallel after an update. Run the
     // teardown+relaunch at most once per process lifetime.
-    static RESTARTING: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    static RESTARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if RESTARTING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         log::info!("restart_app: already in progress, ignoring duplicate invocation");
         return;
@@ -711,7 +721,9 @@ async fn install_addon(
                 &state.tool_manager.markitdown_shim_path(),
                 &state.tool_manager.managed_python(),
             )
-            .map_err(|err| format!("markitdown installed but enabling integration failed: {err:#}"))?;
+            .map_err(|err| {
+                format!("markitdown installed but enabling integration failed: {err:#}")
+            })?;
         }
         "rtk" => {
             state
@@ -2160,7 +2172,9 @@ async fn get_tool_logs(
 }
 
 #[tauri::command]
-async fn get_claude_code_projects(state: State<'_, AppState>) -> Result<Vec<ClaudeCodeProject>, String> {
+async fn get_claude_code_projects(
+    state: State<'_, AppState>,
+) -> Result<Vec<ClaudeCodeProject>, String> {
     state
         .list_claude_code_projects()
         .map_err(|err| err.to_string())
@@ -2536,7 +2550,9 @@ async fn delete_live_learning(state: State<'_, AppState>, memory_id: String) -> 
 }
 
 #[tauri::command]
-async fn list_applied_patterns(project_path: String) -> Result<crate::models::AppliedPatterns, String> {
+async fn list_applied_patterns(
+    project_path: String,
+) -> Result<crate::models::AppliedPatterns, String> {
     Ok(read_applied_patterns_for_project(&project_path))
 }
 
@@ -2878,7 +2894,10 @@ fn validate_contact_request_url(raw: &str) -> Option<reqwest::Url> {
 }
 
 #[tauri::command]
-async fn apply_client_setup(app: AppHandle, client_id: String) -> Result<ClientSetupResult, String> {
+async fn apply_client_setup(
+    app: AppHandle,
+    client_id: String,
+) -> Result<ClientSetupResult, String> {
     // Two recovery paths land on the tray-banner "Re-enable" button:
     //   1. Watchdog give-up — pauses the runtime and clears client setups.
     //   2. Pricing gate (grace expiry, weekly cap) — sets `proxy_bypass` and
@@ -2968,7 +2987,9 @@ async fn detect_oss_remnants() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-async fn get_client_connectors(state: State<'_, AppState>) -> Result<Vec<ClientConnectorStatus>, String> {
+async fn get_client_connectors(
+    state: State<'_, AppState>,
+) -> Result<Vec<ClientConnectorStatus>, String> {
     client_adapters::list_client_connectors(&state.cached_clients()).map_err(|err| err.to_string())
 }
 
@@ -5350,14 +5371,13 @@ mod tests {
         build_watchdog_give_up_report, check_headroom_learn_prereqs, classify_bootstrap_failure,
         classify_upgrade_error, compute_tray_window_position, count_memories_created_today,
         cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
-        empty_live_learnings_for_projects,
-        extract_llm_failure_warnings, fetch_transformations_feed_from, install_pending_update,
-        is_disk_full_signal, is_endpoint_protection_signal, is_network_download_signal,
-        is_port_conflict_failure, is_prerelease_version, lifetime_token_milestone_kind,
-        noop_app_update_progress_emitter, parse_live_learnings,
-        parse_request_count_from_stats_body, parse_request_counts_by_agent,
-        parse_updater_endpoint_list, pattern_matches_project,
-        physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
+        empty_live_learnings_for_projects, extract_llm_failure_warnings,
+        fetch_transformations_feed_from, install_pending_update, is_disk_full_signal,
+        is_endpoint_protection_signal, is_network_download_signal, is_port_conflict_failure,
+        is_prerelease_version, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
+        parse_live_learnings, parse_request_count_from_stats_body, parse_request_counts_by_agent,
+        parse_updater_endpoint_list, pattern_matches_project, physical_rect_from_rect,
+        read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
         resolve_release_updater_config, select_updater_endpoints, store_checked_update,
         watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
