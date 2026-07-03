@@ -1101,6 +1101,15 @@ static UPSTREAM_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLo
 fn upstream_client() -> &'static reqwest::Client {
     UPSTREAM_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            // Connect timeout only — no overall timeout, since bypassed SSE
+            // streams legitimately run for minutes. Without it, a
+            // SYN-blackholed network hangs every bypass request until the
+            // client's own deadline.
+            .connect_timeout(std::time::Duration::from_secs(10))
+            // reqwest honors HTTP(S)_PROXY env vars by default, which would
+            // silently route "direct to provider" traffic through a corporate
+            // proxy the intercept path never uses.
+            .no_proxy()
             .build()
             .expect("reqwest client for bypass forwarder")
     })

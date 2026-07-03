@@ -96,7 +96,9 @@ fn scrub_memory_md_file(path: &Path) -> std::io::Result<usize> {
     if removed == 0 {
         return Ok(0);
     }
-    fs::write(path, cleaned)?;
+    // User-owned file: a crash mid-write must not truncate their memory.
+    crate::client_adapters::atomic_write(path, cleaned.as_bytes())
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
     Ok(removed)
 }
 

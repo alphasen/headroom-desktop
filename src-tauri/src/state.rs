@@ -4312,6 +4312,18 @@ impl SavingsTracker {
     }
 
     fn append_record(&self, record: &SavingsRecord) -> Result<()> {
+        // Append-only and never read back, so unrotated it grows ~50-100 MB/yr
+        // on heavy use. Rotate at 10 MB, keeping one generation for recovery.
+        // ponytail: single .1 generation; add numbered rotation if the archive
+        // ever gains a reader.
+        const MAX_RECORDS_BYTES: u64 = 10 * 1024 * 1024;
+        if std::fs::metadata(&self.records_path)
+            .map(|m| m.len() > MAX_RECORDS_BYTES)
+            .unwrap_or(false)
+        {
+            let rotated = self.records_path.with_extension("jsonl.1");
+            let _ = std::fs::rename(&self.records_path, rotated);
+        }
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)

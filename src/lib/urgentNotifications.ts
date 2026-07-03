@@ -161,7 +161,13 @@ async function fireOncePerDay(
   body: string,
   action: string
 ): Promise<boolean> {
-  const today = new Date().toISOString().slice(0, 10);
+  // Local day, not UTC: with a UTC key the throttle window flips mid-afternoon
+  // for US users, letting two nudges land in one local day (and training
+  // people to disable notifications on the channel urgent alerts share).
+  const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+    now.getDate()
+  ).padStart(2, "0")}`;
   if (localStorage.getItem(storageKey) === today) return false;
   try {
     await invoke("show_notification", { title, body, action });

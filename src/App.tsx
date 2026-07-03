@@ -2565,17 +2565,19 @@ export default function App() {
 
       if (background && patch.availableUpdate) {
         const windowVisible = await getCurrentWindow().isVisible().catch(() => false);
-        if (
-          shouldNotifyAboutAvailableAppUpdate({
-            background,
-            availableUpdate: patch.availableUpdate,
-            knownUpdateVersion,
-            windowVisible,
-          })
-        ) {
+        const notifyFresh = shouldNotifyAboutAvailableAppUpdate({
+          background,
+          availableUpdate: patch.availableUpdate,
+          knownUpdateVersion,
+          windowVisible,
+        });
+        if (notifyFresh) {
           await sendAppUpdateNotification(patch.availableUpdate.version);
         }
-        if (!windowVisible) {
+        // Never stack the stale reminder onto the tick that just announced
+        // the release — first discovery of an old version used to fire both
+        // notifications at once.
+        if (!windowVisible && !notifyFresh) {
           await maybeFireStaleAppUpdateNotification(patch.availableUpdate);
         }
       }

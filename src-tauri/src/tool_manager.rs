@@ -1939,10 +1939,18 @@ impl ToolManager {
             percent: 40,
         });
 
-        // Try direct wheel download (with retries). If it fails, fall back to PyPI index.
+        // Try direct wheel download (with retries). If the transfer fails,
+        // fall back to the PyPI index; a checksum mismatch fails hard instead
+        // — the fallback has no hash verification, so downgrading on mismatch
+        // would bypass the integrity check exactly when it fires.
         let use_wheel =
             match download_to_path(&release.wheel_url, &wheel_path, Some(&release.sha256)) {
                 Ok(()) => true,
+                Err(download_err) if is_checksum_mismatch(&download_err) => {
+                    return Err(download_err.context(
+                        "Headroom wheel failed checksum verification; refusing unverified fallback",
+                    ));
+                }
                 Err(download_err) => {
                     log::warn!(
                     "headroom wheel download failed (will fall back to pip index): {download_err}"
@@ -2886,16 +2894,30 @@ impl ToolManager {
             .runtime
             .downloads_dir
             .join(format!("headroom_ai-{}-py3-none-any.whl", release.version));
-        let use_wheel =
-            match download_to_path(&release.wheel_url, &wheel_path, Some(&release.sha256)) {
-                Ok(()) => true,
-                Err(download_err) => {
-                    log::warn!(
+        let use_wheel = match download_to_path(
+            &release.wheel_url,
+            &wheel_path,
+            Some(&release.sha256),
+        ) {
+            Ok(()) => true,
+            Err(download_err) if is_checksum_mismatch(&download_err) => {
+                // Never downgrade a failed integrity check to an
+                // unverified pip-index install.
+                let restored = self.rollback_in_place_upgrade_inner(&ctx);
+                return UpgradeOutcome::InstallFailed {
+                    restored,
+                    error: download_err.context(
+                        "Headroom wheel failed checksum verification; refusing unverified fallback",
+                    ),
+                };
+            }
+            Err(download_err) => {
+                log::warn!(
                     "headroom wheel download failed (will fall back to pip index): {download_err}"
                 );
-                    false
-                }
-            };
+                false
+            }
+        };
 
         progress(BootstrapStepUpdate {
             step: "Applying update",
@@ -4725,6 +4747,15 @@ fn download_to_path(url: &str, destination: &Path, expected_sha256: Option<&str>
     download_to_path_with_progress(url, destination, expected_sha256, |_, _| {})
 }
 
+/// True when a `download_to_path` failure was a sha256 mismatch (see the
+/// `bail!` in `download_to_path_with_progress`) rather than a transfer error.
+/// A mismatch means the bytes were tampered with or corrupted in transit —
+/// exactly the case the hash exists for — so callers must never respond to it
+/// by falling back to an unverified pip-index install.
+fn is_checksum_mismatch(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("checksum mismatch")
+}
+
 /// Download `url` to `destination` with an optional progress callback.
 ///
 /// The callback receives `(downloaded_bytes, total_bytes)` and is called at
@@ -5766,19 +5797,31 @@ mod tests {
         bootstrap_requirements_lock_for_target, classify_kompress_prefetch_failure,
         extract_required_pydantic_core_version, format_all_foreign_bail,
         format_already_running_bail, headroom_entrypoint_startup_args,
-        headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_outdated_codex,
-        looks_like_corrupt_venv_error, parse_major_minor_patch, parse_pid_from_lsof_detail,
-        path_with_binary_dir, pre_upstream_concurrency, probe_backend_readyz_ok,
-        proxy_argv_contains_expected_flags, read_headroom_learn_metadata_from_path,
-        receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
-        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
-        sha256_bytes, summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
-        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, ToolManager,
-        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, RTK_VERSION,
+        headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
+        is_outdated_codex, looks_like_corrupt_venv_error, parse_major_minor_patch,
+        parse_pid_from_lsof_detail, path_with_binary_dir, pre_upstream_concurrency,
+        probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
+        read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
+        reclaim_orphan_proxy, redact_sensitive, requirements_lock_sha, rtk_distribution_artifact,
+        run_command, sanitize_log_variant, sha256_bytes, summarize_kompress_prefetch_failure,
+        verify_sha256_file, wait_for_port_free, CommandFailure, HeadroomRelease, ManagedRuntime,
+        PipOutputCapture, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, RTK_VERSION,
     };
     use crate::backend_port;
     use crate::port_conflict;
     use std::net::TcpListener;
+
+    #[test]
+    fn is_checksum_mismatch_detects_bail_through_context_layers() {
+        // Pins the string coupling with download_to_path_with_progress's
+        // bail! — reword one side and the unverified-fallback guard dies.
+        let err = anyhow::anyhow!("checksum mismatch for https://x: expected aa, got bb")
+            .context("downloading wheel");
+        assert!(is_checksum_mismatch(&err));
+        assert!(!is_checksum_mismatch(&anyhow::anyhow!(
+            "connection reset by peer"
+        )));
+    }
 
     #[test]
     fn sitecustomize_registers_nonchaining_sigusr1_dump() {

@@ -2229,9 +2229,11 @@ fn write_local_state(state: &LocalPricingState) -> Result<(), String> {
             )
         })?;
     }
-    std::fs::write(
+    // Atomic: a crash mid-write used to truncate the file, silently resetting
+    // trial/grace clocks on the next load.
+    crate::client_adapters::atomic_write(
         &path,
-        serde_json::to_vec_pretty(state)
+        &serde_json::to_vec_pretty(state)
             .map_err(|err| format!("Failed to serialize pricing state: {err}"))?,
     )
     .map_err(|err| format!("Failed to write pricing state {}: {err}", path.display()))

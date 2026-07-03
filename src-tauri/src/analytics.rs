@@ -276,14 +276,19 @@ fn dispatcher_loop(receiver: Receiver<WorkerMessage>, config: AnalyticsConfig) {
                 queue.push_back(event);
             }
             Ok(WorkerMessage::Shutdown) => {
-                flush_queue(&http_client, &config, &mut queue);
+                // The app's exit handler joins this thread: bound the final
+                // flush so quitting offline can't hang the app for
+                // chunks × HTTP timeout (10s each). Unsent events are dropped
+                // — it's telemetry, and the process is exiting.
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                flush_queue(&http_client, &config, &mut queue, Some(deadline));
                 return;
             }
             Err(RecvTimeoutError::Timeout) => {
-                flush_queue(&http_client, &config, &mut queue);
+                flush_queue(&http_client, &config, &mut queue, None);
             }
             Err(RecvTimeoutError::Disconnected) => {
-                flush_queue(&http_client, &config, &mut queue);
+                flush_queue(&http_client, &config, &mut queue, None);
                 return;
             }
         }
@@ -305,13 +310,21 @@ fn build_http_client(config: &AnalyticsConfig) -> Client {
         .expect("could not build analytics http client")
 }
 
-fn flush_queue(client: &Client, config: &AnalyticsConfig, queue: &mut VecDeque<Value>) {
+fn flush_queue(
+    client: &Client,
+    config: &AnalyticsConfig,
+    queue: &mut VecDeque<Value>,
+    deadline: Option<std::time::Instant>,
+) {
     if queue.is_empty() {
         return;
     }
 
     let mut failed = Vec::new();
     while !queue.is_empty() {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
         let chunk_len = queue.len().min(25);
         let events: Vec<Value> = queue.drain(..chunk_len).collect();
         let response = client
