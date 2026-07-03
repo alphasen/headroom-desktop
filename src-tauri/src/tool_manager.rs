@@ -193,6 +193,28 @@ const ATOMIC_REBUILD_FLOOR_VERSION: (u32, u32, u32) = (0, 20, 0);
 /// pre-release/build suffixes (`-rc.1`, `+build`, `.dev0`, etc.). Returns
 /// None when the prefix isn't a numeric `major.minor`. `patch` defaults to
 /// 0 when missing or unparseable, so `"0.19"` and `"0.19.0"` compare equal.
+/// Injected onto the backend's PYTHONPATH so the `site` module imports it at
+/// interpreter startup. `faulthandler.register` needs Python-side code — the
+/// PYTHONFAULTHANDLER env only covers fatal signals — and the upstream proxy
+/// has no dump hook of its own.
+const SITECUSTOMIZE_PY: &str = r#""""Headroom Desktop injection (managed -- do not edit).
+
+Registers SIGUSR1 to dump all Python thread stacks to stderr (the proxy
+log). The desktop watchdog sends SIGUSR1 before force-killing a wedged
+backend so the log shows what the event loop was stuck on.
+"""
+import faulthandler
+import signal
+
+# No chain=True: SIGUSR1's default disposition is terminate, and chaining
+# falls through to it after the dump -- the process must survive the dump so
+# the watchdog controls the actual kill.
+try:
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+except Exception:
+    pass
+"#;
+
 /// Pre-upstream concurrency passed to the backend: 2x logical cores,
 /// clamped to [8, 32]. See the spawn-site comment for why the proxy's own
 /// 8-cap is safe to exceed under the desktop's env.
@@ -844,6 +866,17 @@ impl ToolManager {
                     .open(&log_path)
                     .with_context(|| format!("opening {}", log_path.display()))?;
 
+                // SIGUSR1 -> faulthandler dump of all Python threads into the
+                // proxy log (see SITECUSTOMIZE_PY). The dir holds nothing but
+                // sitecustomize.py, so PYTHONPATH can't shadow real imports.
+                // Best-effort: a failed write only costs the wedge diagnostics.
+                let inject_dir = self.runtime.root_dir.join("pyinject");
+                if let Err(err) = std::fs::create_dir_all(&inject_dir).and_then(|_| {
+                    std::fs::write(inject_dir.join("sitecustomize.py"), SITECUSTOMIZE_PY)
+                }) {
+                    log::warn!("[tool_manager] writing pyinject/sitecustomize.py failed: {err}");
+                }
+
                 // Wrap with `nice` so headroom yields CPU to foreground apps
                 // (Claude Code, terminal, etc.) when the machine is contended.
                 // On idle systems headroom still runs at full speed.
@@ -859,6 +892,7 @@ impl ToolManager {
                     .current_dir(&self.runtime.root_dir)
                     .process_group(0)
                     .env("PYTHONNOUSERSITE", "1")
+                    .env("PYTHONPATH", &inject_dir)
                     .env("PYTHONUNBUFFERED", "1")
                     .env("PYTHONFAULTHANDLER", "1")
                     .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
@@ -5745,6 +5779,14 @@ mod tests {
     use crate::backend_port;
     use crate::port_conflict;
     use std::net::TcpListener;
+
+    #[test]
+    fn sitecustomize_registers_nonchaining_sigusr1_dump() {
+        assert!(super::SITECUSTOMIZE_PY
+            .contains("faulthandler.register(signal.SIGUSR1, all_threads=True)"));
+        // chain=True would fall through to SIGUSR1's default terminate action.
+        assert!(!super::SITECUSTOMIZE_PY.contains("chain=True)"));
+    }
 
     #[test]
     fn pre_upstream_concurrency_stays_within_bounds() {

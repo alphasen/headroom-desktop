@@ -4828,6 +4828,10 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                         "watchdog: backend wedged ({backend_readyz_outcome}) after {consecutive_failures} failures; force-killing and restarting"
                     );
                     hung_kill_attempted = true;
+                    // Wedges leave no diagnostics (the proxy log just goes
+                    // silent), so ask the backend for a faulthandler dump of
+                    // all Python threads before killing it.
+                    state.dump_backend_stacks();
                     state.stop_headroom();
                     consecutive_failures = 0;
                     match state.ensure_headroom_running() {

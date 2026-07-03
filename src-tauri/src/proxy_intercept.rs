@@ -305,7 +305,14 @@ async fn handle(
     let is_models_fetch = parsed_head.as_ref().is_some_and(|head| {
         head.method.eq_ignore_ascii_case("GET")
             && (head.path == "/v1/models" || head.path.starts_with("/v1/models?"))
-    });
+    })
+        // `/v1/models` exists on both providers, so the path alone can't
+        // attribute the fetch. Claude Code always sends Anthropic request
+        // markers; Codex never does. Without this gate every Anthropic
+        // catalog fetch paid the buffering / re-serialization / Sentry-warning
+        // cost of a rewrite that only exists for Codex.
+        && !request_has_header(&buf, "anthropic-version")
+        && !request_has_header(&buf, "x-api-key");
 
     // Scan headers for a Bearer token and capture it. When the token's
     // value differs from what was previously in the slot — or the slot was
@@ -387,7 +394,9 @@ async fn handle(
         // gate) never reaches here — the bypass branches above handle it.
         // `forward_direct_to_anthropic` routes OpenAI paths to
         // OPENAI_DIRECT_BASE, so Codex degrades identically to Claude.
-        log::warn!("backend {backend_addr} unreachable; forwarding request direct to provider");
+        // info, not warn: warn would ship to Sentry per request; the watchdog's
+        // capture_watchdog_give_up already reports genuine down episodes.
+        log::info!("backend {backend_addr} unreachable; forwarding request direct to provider");
         forward_direct_to_anthropic(client, buf, &upstream_base).await;
         return;
     };
@@ -676,10 +685,18 @@ async fn splice_with_codex_capture(
             }
         }
 
-        // On an upstream error status, buffer one bounded chunk of the error
-        // body for a Sentry report. Codex error responses are small JSON (not
-        // the SSE stream), so this never delays the streaming happy path — that
-        // path takes the `else` and is byte-for-byte identical to before.
+        // Forward the head bytes we read first (full head on success, partial
+        // on timeout/EOF — `read_http_headers` may also include leading body
+        // bytes it over-read). The error-body peek below must never sit in
+        // front of this write: it used to delay the client's status line by up
+        // to 3s when the backend dallied after the head.
+        if client_wr.write_all(&head).await.is_err() {
+            return;
+        }
+        // On an upstream error status, peek one bounded chunk of the error
+        // body for a Sentry report and forward it immediately. Codex error
+        // responses are small JSON (not the SSE stream), so the streaming
+        // happy path never takes this branch.
         if let Some(status) = parse_response_status(&head).filter(is_reportable_codex_error) {
             let mut chunk = vec![0u8; MAX_ERROR_BODY];
             let n = match tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, backend_rd.read(&mut chunk))
@@ -689,19 +706,10 @@ async fn splice_with_codex_capture(
                 _ => 0,
             };
             chunk.truncate(n);
-            report_codex_upstream_error(status, req_path, &head, &chunk);
-            // Forward head + the chunk we peeked, then splice any remainder.
-            if client_wr.write_all(&head).await.is_err() {
-                return;
-            }
             if client_wr.write_all(&chunk).await.is_err() {
                 return;
             }
-        } else if client_wr.write_all(&head).await.is_err() {
-            // Forward the head bytes we read (full head on success, partial on
-            // timeout/EOF — `read_http_headers` may also include leading body
-            // bytes it over-read), then splice the rest of the response through.
-            return;
+            report_codex_upstream_error(status, req_path, &head, &chunk);
         }
         let mut stamped = StampReader(backend_rd);
         let _ = tokio::io::copy(&mut stamped, &mut client_wr).await;
@@ -732,7 +740,9 @@ fn is_reportable_codex_error(status: &u16) -> bool {
 }
 
 /// Report a Codex upstream error to Sentry with the status, request path and a
-/// truncated error body (head's over-read body bytes + the peeked chunk).
+/// structural summary of the error body (never the raw body: OpenAI 400s
+/// frequently echo request fields, so raw attachment would leak prompt
+/// fragments into Sentry).
 fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: &[u8]) {
     let head_body = find_header_end(head)
         .map(|e| &head[(e + 4).min(head.len())..])
@@ -740,8 +750,13 @@ fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: 
     let mut body: Vec<u8> = Vec::with_capacity(head_body.len() + chunk.len());
     body.extend_from_slice(head_body);
     body.extend_from_slice(chunk);
-    let snippet: String = String::from_utf8_lossy(&body).chars().take(2000).collect();
+    let snippet = codex_error_summary(&body);
     let path = req_path.to_string();
+    // The raw body stays on-device: the local log keeps full debugging detail
+    // (OpenAI 400s often quote request fields, so only the structural summary
+    // above may leave the machine via Sentry).
+    let raw_snippet: String = String::from_utf8_lossy(&body).chars().take(2000).collect();
+    log::warn!("codex upstream error {status} on {path}: {raw_snippet}");
     // Group by status so each upstream failure class is its own Sentry issue.
     // Without an explicit fingerprint, Sentry parameterizes the message
     // ("codex upstream error {status} on {path}") and collapses 401 noise, 403
@@ -762,6 +777,31 @@ fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: 
             );
         },
     );
+}
+
+/// Reduce an upstream error body to structural fields safe for Sentry:
+/// `error.type` / `error.code` / `error.param`, never free-text (the
+/// `message` field and raw bodies can quote request content).
+fn codex_error_summary(body: &[u8]) -> String {
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(json) => {
+            let err = json.get("error").unwrap_or(&json);
+            let field = |key: &str| {
+                err.get(key)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-")
+                    .to_string()
+            };
+            format!(
+                "type={} code={} param={}",
+                field("type"),
+                field("code"),
+                field("param")
+            )
+        }
+        // Truncated (peek is bounded) or non-JSON body — report size only.
+        Err(_) => format!("unparseable error body ({} bytes)", body.len()),
+    }
 }
 
 /// Parse the `x-codex-*` rate-limit headers out of a raw HTTP response head
@@ -1670,13 +1710,14 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bearer_value_changed, codex_snapshot_from_usage_payload, codex_window_label,
-        decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
-        is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
-        is_openai_path, is_reportable_codex_error, parse_codex_rate_limit_headers,
-        parse_request_head, parse_response_status, read_http_headers, request_has_header,
-        request_is_loopback_safe, rewrite_use_responses_lite, run, set_response_content_length,
-        stamp_codex_client_header, strip_request_header, BypassFlag, ModelsRewrite, SharedToken,
+        bearer_value_changed, codex_error_summary, codex_snapshot_from_usage_payload,
+        codex_window_label, decode_codex_plan_tier, extract_bearer, extract_header_value,
+        find_header_end, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
+        is_local_proxy_path, is_openai_path, is_reportable_codex_error,
+        parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
+        read_http_headers, request_has_header, request_is_loopback_safe,
+        rewrite_use_responses_lite, run, set_response_content_length, stamp_codex_client_header,
+        strip_request_header, BypassFlag, ModelsRewrite, SharedToken,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -3007,6 +3048,128 @@ mod tests {
         run_task.abort();
         backend_task.abort();
         backend_port::reset_for_tests();
+    }
+
+    #[tokio::test]
+    #[serial(backend_port)]
+    async fn intercept_skips_models_rewrite_for_anthropic_fetch() {
+        // Same catalog shape, but the request carries Anthropic markers —
+        // the Codex-only lite-flag rewrite must leave it untouched.
+        let models_json = br#"{"models":[{"slug":"gpt-5.5","use_responses_lite":true}]}"#.to_vec();
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        let backend_task = tokio::spawn(async move {
+            let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
+            let _ = read_until_header_end(&mut sock).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                models_json.len()
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.write_all(&models_json).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        backend_port::set(backend_addr.port());
+
+        let token_slot: SharedToken = Arc::new(Mutex::new(None));
+        let intercept_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("intercept bind");
+        let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
+        drop(intercept_listener);
+        let slot_for_run = token_slot.clone();
+        let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
+        let upstream_base = Arc::new("https://api.anthropic.com".to_string());
+        let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+        let run_task = tokio::spawn(async move {
+            let _ = run(
+                intercept_addr,
+                slot_for_run,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                bypass_for_run,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                fresh_bearer_tx,
+                upstream_base,
+            )
+            .await;
+        });
+
+        let mut client = None;
+        for _ in 0..50 {
+            if let Ok(c) = TcpStream::connect(intercept_addr).await {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut client = client.expect("intercept reachable");
+
+        let request = format!(
+            "GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nanthropic-version: 2023-06-01\r\n\r\n",
+            intercept_addr.port()
+        );
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+
+        let mut response = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let _ = timeout(Duration::from_secs(2), async {
+            loop {
+                match client.read(&mut tmp).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        response.extend_from_slice(&tmp[..n]);
+                        if let Some(end) = find_header_end(&response) {
+                            if serde_json::from_slice::<serde_json::Value>(&response[end + 4..])
+                                .is_ok()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+
+        let end = find_header_end(&response).expect("response head complete");
+        let body: serde_json::Value =
+            serde_json::from_slice(&response[end + 4..]).expect("json body");
+        assert_eq!(
+            body["models"][0]["use_responses_lite"],
+            serde_json::Value::Bool(true),
+            "anthropic-marked models fetch must pass through unrewritten: {body}"
+        );
+
+        run_task.abort();
+        backend_task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    #[test]
+    fn codex_error_summary_extracts_structural_fields_only() {
+        let body = br#"{"error":{"message":"Invalid prompt: SECRET user content here","type":"invalid_request_error","param":"messages","code":"invalid_prompt"}}"#;
+        let summary = codex_error_summary(body);
+        assert_eq!(
+            summary,
+            "type=invalid_request_error code=invalid_prompt param=messages"
+        );
+        assert!(
+            !summary.contains("SECRET"),
+            "free-text message must never reach Sentry: {summary}"
+        );
+    }
+
+    #[test]
+    fn codex_error_summary_handles_non_json() {
+        assert_eq!(
+            codex_error_summary(b"<html>gateway error</html>"),
+            "unparseable error body (26 bytes)"
+        );
     }
 
     #[test]

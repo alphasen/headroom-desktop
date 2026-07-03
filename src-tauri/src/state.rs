@@ -2870,6 +2870,23 @@ impl AppState {
         self.ensure_headroom_running()
     }
 
+    /// Ask the backend to dump all Python thread stacks into its own log
+    /// (SIGUSR1 handler registered by the desktop-injected sitecustomize.py),
+    /// then give it a moment to flush. Called by the watchdog right before a
+    /// wedge force-kill so a silent hang leaves evidence of where the event
+    /// loop was stuck. Blocking sleep is fine: only the watchdog thread calls
+    /// this, once per down episode.
+    pub fn dump_backend_stacks(&self) {
+        let Some(pid) = self.headroom_process.lock().as_ref().map(|c| c.id()) else {
+            return;
+        };
+        let _ = std::process::Command::new("/bin/kill")
+            .arg("-USR1")
+            .arg(pid.to_string())
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
+
     pub fn stop_headroom(&self) {
         let _lifecycle_guard = self.lifecycle_lock.lock();
         self.set_runtime_starting(false);
