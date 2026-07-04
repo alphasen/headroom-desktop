@@ -200,7 +200,23 @@ pub struct DashboardState {
     /// Highest terms version this user has already accepted (0 = none).
     pub accepted_terms_version: u32,
     /// Canonical Terms-of-Service URL the acceptance gate links to.
-    pub terms_url: String,
+pub terms_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepSeekBalanceInfo {
+ pub currency: String,
+ pub total_balance: String,
+ pub granted_balance: String,
+ pub topped_up_balance: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepSeekBalanceResponse {
+ pub is_available: bool,
+ pub balance_infos: Vec<DeepSeekBalanceInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

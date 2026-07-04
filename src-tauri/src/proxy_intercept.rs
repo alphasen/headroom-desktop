@@ -125,7 +125,14 @@ pub fn spawn(
     codex_bypass: BypassFlag,
     fresh_bearer_tx: FreshBearerNotifier,
 ) {
-    let upstream_base = Arc::new(ANTHROPIC_DIRECT_BASE.to_string());
+    let anthropic_upstream_base = Arc::new(
+        std::env::var("HEADROOM_ANTHROPIC_UPSTREAM")
+            .unwrap_or_else(|_| ANTHROPIC_DIRECT_BASE.to_string()),
+    );
+    let openai_upstream_base = Arc::new(
+        std::env::var("HEADROOM_OPENAI_UPSTREAM")
+            .unwrap_or_else(|_| OPENAI_DIRECT_BASE.to_string()),
+    );
     std::thread::Builder::new()
         .name("proxy-intercept".into())
         .spawn(move || {
@@ -134,69 +141,62 @@ pub fn spawn(
                 .build()
                 .expect("proxy intercept runtime");
             rt.block_on(async move {
-                let bind_addr: SocketAddr = ([127, 0, 0, 1], INTERCEPT_PORT).into();
-                // The intercept is the app's front door: client configs point
-                // all traffic at this port, so a bind failure must never end
-                // the thread permanently — the squatter (a crashed prior
-                // instance mid-exit, or a foreign process) may release the
-                // port at any time, and giving up strands every client on a
-                // dead endpoint with no recovery until app relaunch. Retry
-                // forever; report each distinct error to Sentry once.
-                let mut reported_errors: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                loop {
-                    match run(
-                        bind_addr,
-                        token_slot.clone(),
-                        codex_slot.clone(),
-                        codex_plan_slot.clone(),
-                        bypass.clone(),
-                        claude_only_bypass.clone(),
-                        codex_bypass.clone(),
-                        fresh_bearer_tx.clone(),
-                        upstream_base.clone(),
-                    )
-                    .await
-                    {
-                        Ok(()) => return,
-                        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                            // If /health responds over HTTP, an existing
-                            // Headroom proxy owns the port (single-instance
-                            // plugin should normally prevent this, but a
-                            // crashed or still-exiting prior process can leave
-                            // it held) — benign, just wait for it to go away.
-                            // Otherwise the port is foreign; escalate once.
-                            if probe_existing_intercept().await {
-                                log::info!(
-                                    "[proxy_intercept] port {INTERCEPT_PORT} owned by existing Headroom proxy; retrying in 15s"
-                                );
-                            } else {
-                                log::warn!(
-                                    "[proxy_intercept] port {INTERCEPT_PORT} held by foreign process; retrying in 15s ({e})"
-                                );
-                                if reported_errors.insert(format!("foreign:{e}")) {
-                                    sentry::capture_message(
-                                        &format!(
-                                            "proxy_intercept bind failed: {e} (port {INTERCEPT_PORT} held by foreign process; retrying)"
-                                        ),
-                                        sentry::Level::Error,
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("[proxy_intercept] error: {e}; retrying in 15s");
-                            if reported_errors.insert(e.to_string()) {
+            let bind_addr: SocketAddr = ([127, 0, 0, 1], INTERCEPT_PORT).into();
+            // Intercept is the app's front door: client configs point all
+            // traffic at this port, so bind failure must never permanently end
+            // the thread. A crashed prior instance or a foreign squatter may
+            // release the port later; keep retrying and report each distinct
+            // failure once.
+            let mut reported_errors: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            loop {
+                match run(
+                    bind_addr,
+                    token_slot.clone(),
+                    codex_slot.clone(),
+                    codex_plan_slot.clone(),
+                    bypass.clone(),
+                    claude_only_bypass.clone(),
+                    codex_bypass.clone(),
+                    fresh_bearer_tx.clone(),
+                    anthropic_upstream_base.clone(),
+                    openai_upstream_base.clone(),
+                )
+                .await
+                {
+                    Ok(()) => return,
+                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                        if probe_existing_intercept().await {
+                            log::info!(
+                                "[proxy_intercept] port {INTERCEPT_PORT} owned by existing Headroom proxy; retrying in 15s"
+                            );
+                        } else {
+                            log::warn!(
+                                "[proxy_intercept] port {INTERCEPT_PORT} held by foreign process; retrying in 15s ({e})"
+                            );
+                            if reported_errors.insert(format!("foreign:{e}")) {
                                 sentry::capture_message(
-                                    &format!("proxy_intercept error: {e} (retrying)"),
+                                    &format!(
+                                        "proxy_intercept bind failed: {e} (port {INTERCEPT_PORT} held by foreign process; retrying)"
+                                    ),
                                     sentry::Level::Error,
                                 );
                             }
                         }
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    Err(e) => {
+                        log::warn!("[proxy_intercept] error: {e}; retrying in 15s");
+                        if reported_errors.insert(e.to_string()) {
+                            sentry::capture_message(
+                                &format!("proxy_intercept error: {e} (retrying)"),
+                                sentry::Level::Error,
+                            );
+                        }
+                    }
                 }
-            });
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            }
+        });
         })
         .expect("spawn proxy intercept thread");
 }
@@ -210,7 +210,8 @@ async fn run(
     claude_only_bypass: BypassFlag,
     codex_bypass: BypassFlag,
     fresh_bearer_tx: FreshBearerNotifier,
-    upstream_base: Arc<String>,
+    anthropic_upstream_base: Arc<String>,
+    openai_upstream_base: Arc<String>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
 
@@ -223,7 +224,8 @@ async fn run(
                 let bypass = bypass.clone();
                 let claude_only_bypass = claude_only_bypass.clone();
                 let codex_bypass = codex_bypass.clone();
-                let upstream_base = upstream_base.clone();
+                let anthropic_upstream_base = anthropic_upstream_base.clone();
+                let openai_upstream_base = openai_upstream_base.clone();
                 let tx = fresh_bearer_tx.clone();
                 tokio::spawn(handle(
                     client,
@@ -234,7 +236,8 @@ async fn run(
                     claude_only_bypass,
                     codex_bypass,
                     tx,
-                    upstream_base,
+                    anthropic_upstream_base,
+                    openai_upstream_base,
                 ));
             }
             Err(e) => {
@@ -269,7 +272,8 @@ async fn handle(
     claude_only_bypass: BypassFlag,
     codex_bypass: BypassFlag,
     fresh_bearer_tx: FreshBearerNotifier,
-    upstream_base: Arc<String>,
+    anthropic_upstream_base: Arc<String>,
+    openai_upstream_base: Arc<String>,
 ) {
     // Re-read the backend port on each connection. `tool_manager` selects the
     // port (and may switch to a fallback) when the proxy spawn runs, which
@@ -321,14 +325,7 @@ async fn handle(
     let is_models_fetch = parsed_head.as_ref().is_some_and(|head| {
         head.method.eq_ignore_ascii_case("GET")
             && (head.path == "/v1/models" || head.path.starts_with("/v1/models?"))
-    })
-        // `/v1/models` exists on both providers, so the path alone can't
-        // attribute the fetch. Claude Code always sends Anthropic request
-        // markers; Codex never does. Without this gate every Anthropic
-        // catalog fetch paid the buffering / re-serialization / Sentry-warning
-        // cost of a rewrite that only exists for Codex.
-        && !request_has_header(&buf, "anthropic-version")
-        && !request_has_header(&buf, "x-api-key");
+    });
 
     // Scan headers for a Bearer token and capture it. When the token's
     // value differs from what was previously in the slot — or the slot was
@@ -337,21 +334,17 @@ async fn handle(
     // identity with headroom-web. The send is non-blocking; the actual
     // OAuth-profile fetch happens off the request hot path.
     if let Some(token) = extract_bearer(&buf) {
+        let changed = bearer_value_changed(&token_slot, &token);
         // For Codex requests the bearer is an OpenAI OAuth JWT carrying the
-        // ChatGPT plan; decode it so the Codex gate can recommend a tier. It
-        // must never land in the Claude bearer slot: pricing would send it to
-        // Anthropic's OAuth profile/usage endpoints (cross-provider credential
-        // transmission) where it only earns 401s.
+        // ChatGPT plan; decode it so the Codex gate can recommend a tier.
         if is_codex {
             if let Some(tier) = decode_codex_plan_tier(&token) {
                 *codex_plan_slot.lock() = Some(tier);
             }
-        } else {
-            let changed = bearer_value_changed(&token_slot, &token);
-            *token_slot.lock() = Some(BearerToken::new(token));
-            if changed {
-                let _ = fresh_bearer_tx.send(());
-            }
+        }
+        *token_slot.lock() = Some(BearerToken::new(token));
+        if changed {
+            let _ = fresh_bearer_tx.send(());
         }
     }
 
@@ -377,7 +370,8 @@ async fn handle(
     // `backend_addr` is intentionally stopped. Forward direct to Anthropic so
     // already-running CC sessions stay alive while optimization is off.
     if bypass.load(Ordering::Acquire) {
-        forward_direct_to_anthropic(client, buf, &upstream_base).await;
+        forward_direct_to_upstream(client, buf, &anthropic_upstream_base, &openai_upstream_base)
+            .await;
         return;
     }
 
@@ -386,34 +380,31 @@ async fn handle(
     // only Claude (non-Codex) traffic direct; Codex falls through to the backend
     // below. This keeps a Claude overage from pausing Codex optimization.
     if !is_codex && claude_only_bypass.load(Ordering::Acquire) {
-        forward_direct_to_anthropic(client, buf, &upstream_base).await;
+        forward_direct_to_upstream(client, buf, &anthropic_upstream_base, &openai_upstream_base)
+            .await;
         return;
     }
 
     // Codex-only gate: when a free user has crossed the weekly Codex limit,
     // forward Codex traffic straight to OpenAI (unoptimized) while leaving the
-    // Python backend up for Claude. `forward_direct_to_anthropic` routes
-    // OpenAI paths to OPENAI_DIRECT_BASE, so it does the right thing here.
+    // Python backend up for Claude. `forward_direct_to_upstream` routes
+    // OpenAI paths to the configured OpenAI upstream, so it does the right
+    // thing here.
     if is_codex && codex_bypass.load(Ordering::Acquire) {
-        forward_direct_to_anthropic(client, buf, &upstream_base).await;
+        forward_direct_to_upstream(client, buf, &anthropic_upstream_base, &openai_upstream_base)
+            .await;
         return;
     }
 
     // Forward to the headroom backend.
     let Ok(mut backend) = TcpStream::connect(backend_addr).await else {
-        // Backend down or mid-restart (crash, gate transition, post-update
-        // cold boot — which deliberately holds the bypass flags off for up to
-        // 10 minutes): fall back per-request to the native provider instead
-        // of a bare 502, so in-flight Claude Code / Codex sessions keep
-        // working, merely unoptimized and unmetered, until the watchdog
-        // brings the backend back. A deliberately-stopped backend (pricing
-        // gate) never reaches here — the bypass branches above handle it.
-        // `forward_direct_to_anthropic` routes OpenAI paths to
-        // OPENAI_DIRECT_BASE, so Codex degrades identically to Claude.
-        // info, not warn: warn would ship to Sentry per request; the watchdog's
-        // capture_watchdog_give_up already reports genuine down episodes.
-        log::info!("backend {backend_addr} unreachable; forwarding request direct to provider");
-        forward_direct_to_anthropic(client, buf, &upstream_base).await;
+        // Backend down or mid-restart: fall back per-request to the native
+        // provider instead of hard-failing in-flight sessions. Deliberately
+        // stopped backends never reach here — bypass branches above handle
+        // those cases directly.
+        log::info!("backend {backend_addr} unreachable; forwarding request direct provider");
+        forward_direct_to_upstream(client, buf, &anthropic_upstream_base, &openai_upstream_base)
+            .await;
         return;
     };
 
@@ -701,18 +692,10 @@ async fn splice_with_codex_capture(
             }
         }
 
-        // Forward the head bytes we read first (full head on success, partial
-        // on timeout/EOF — `read_http_headers` may also include leading body
-        // bytes it over-read). The error-body peek below must never sit in
-        // front of this write: it used to delay the client's status line by up
-        // to 3s when the backend dallied after the head.
-        if client_wr.write_all(&head).await.is_err() {
-            return;
-        }
-        // On an upstream error status, peek one bounded chunk of the error
-        // body for a Sentry report and forward it immediately. Codex error
-        // responses are small JSON (not the SSE stream), so the streaming
-        // happy path never takes this branch.
+        // On an upstream error status, buffer one bounded chunk of the error
+        // body for a Sentry report. Codex error responses are small JSON (not
+        // the SSE stream), so this never delays the streaming happy path — that
+        // path takes the `else` and is byte-for-byte identical to before.
         if let Some(status) = parse_response_status(&head).filter(is_reportable_codex_error) {
             let mut chunk = vec![0u8; MAX_ERROR_BODY];
             let n = match tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, backend_rd.read(&mut chunk))
@@ -722,10 +705,19 @@ async fn splice_with_codex_capture(
                 _ => 0,
             };
             chunk.truncate(n);
+            report_codex_upstream_error(status, req_path, &head, &chunk);
+            // Forward head + the chunk we peeked, then splice any remainder.
+            if client_wr.write_all(&head).await.is_err() {
+                return;
+            }
             if client_wr.write_all(&chunk).await.is_err() {
                 return;
             }
-            report_codex_upstream_error(status, req_path, &head, &chunk);
+        } else if client_wr.write_all(&head).await.is_err() {
+            // Forward the head bytes we read (full head on success, partial on
+            // timeout/EOF — `read_http_headers` may also include leading body
+            // bytes it over-read), then splice the rest of the response through.
+            return;
         }
         let mut stamped = StampReader(backend_rd);
         let _ = tokio::io::copy(&mut stamped, &mut client_wr).await;
@@ -756,9 +748,7 @@ fn is_reportable_codex_error(status: &u16) -> bool {
 }
 
 /// Report a Codex upstream error to Sentry with the status, request path and a
-/// structural summary of the error body (never the raw body: OpenAI 400s
-/// frequently echo request fields, so raw attachment would leak prompt
-/// fragments into Sentry).
+/// truncated error body (head's over-read body bytes + the peeked chunk).
 fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: &[u8]) {
     let head_body = find_header_end(head)
         .map(|e| &head[(e + 4).min(head.len())..])
@@ -766,13 +756,8 @@ fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: 
     let mut body: Vec<u8> = Vec::with_capacity(head_body.len() + chunk.len());
     body.extend_from_slice(head_body);
     body.extend_from_slice(chunk);
-    let snippet = codex_error_summary(&body);
+    let snippet: String = String::from_utf8_lossy(&body).chars().take(2000).collect();
     let path = req_path.to_string();
-    // The raw body stays on-device: the local log keeps full debugging detail
-    // (OpenAI 400s often quote request fields, so only the structural summary
-    // above may leave the machine via Sentry).
-    let raw_snippet: String = String::from_utf8_lossy(&body).chars().take(2000).collect();
-    log::warn!("codex upstream error {status} on {path}: {raw_snippet}");
     // Group by status so each upstream failure class is its own Sentry issue.
     // Without an explicit fingerprint, Sentry parameterizes the message
     // ("codex upstream error {status} on {path}") and collapses 401 noise, 403
@@ -793,31 +778,6 @@ fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: 
             );
         },
     );
-}
-
-/// Reduce an upstream error body to structural fields safe for Sentry:
-/// `error.type` / `error.code` / `error.param`, never free-text (the
-/// `message` field and raw bodies can quote request content).
-fn codex_error_summary(body: &[u8]) -> String {
-    match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(json) => {
-            let err = json.get("error").unwrap_or(&json);
-            let field = |key: &str| {
-                err.get(key)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("-")
-                    .to_string()
-            };
-            format!(
-                "type={} code={} param={}",
-                field("type"),
-                field("code"),
-                field("param")
-            )
-        }
-        // Truncated (peek is bounded) or non-JSON body — report size only.
-        Err(_) => format!("unparseable error body ({} bytes)", body.len()),
-    }
 }
 
 /// Parse the `x-codex-*` rate-limit headers out of a raw HTTP response head
@@ -1117,30 +1077,23 @@ static UPSTREAM_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLo
 fn upstream_client() -> &'static reqwest::Client {
     UPSTREAM_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            // Connect timeout only — no overall timeout, since bypassed SSE
-            // streams legitimately run for minutes. Without it, a
-            // SYN-blackholed network hangs every bypass request until the
-            // client's own deadline.
-            .connect_timeout(std::time::Duration::from_secs(10))
-            // reqwest honors HTTP(S)_PROXY env vars by default, which would
-            // silently route "direct to provider" traffic through a corporate
-            // proxy the intercept path never uses.
-            .no_proxy()
             .build()
             .expect("reqwest client for bypass forwarder")
     })
 }
 
-/// Forward the request that produced `header_buf` directly to api.anthropic.com.
+/// Forward the request that produced `header_buf` directly to the configured
+/// provider upstream.
 ///
-/// Used when the pricing gate has stopped the local Python proxy. The CC
-/// session keeps speaking HTTP/1.1 to 127.0.0.1:6767; we re-issue the same
-/// request to the real Anthropic endpoint over TLS with `reqwest`, then stream
-/// the response back as HTTP/1.1 chunked transfer.
-async fn forward_direct_to_anthropic(
+/// Used when the pricing gate has stopped the local Python proxy. The client
+/// keeps speaking HTTP/1.1 to 127.0.0.1:6767; we re-issue the same request to
+/// the configured Anthropic or OpenAI upstream over TLS with `reqwest`, then
+/// stream the response back as HTTP/1.1 chunked transfer.
+async fn forward_direct_to_upstream(
     mut client: TcpStream,
     header_buf: Vec<u8>,
-    upstream_base: &str,
+    anthropic_upstream_base: &str,
+    openai_upstream_base: &str,
 ) {
     let header_end = match find_header_end(&header_buf) {
         Some(pos) => pos + 4,
@@ -1178,11 +1131,8 @@ async fn forward_direct_to_anthropic(
     // OpenAI's, separate from Headroom's Claude account gate, so don't break
     // Codex when the gate trips — forward OpenAI paths to OpenAI directly
     // rather than (wrongly) to api.anthropic.com.
-    let effective_base: &str = if is_openai_path(&parsed.path) {
-        OPENAI_DIRECT_BASE
-    } else {
-        upstream_base
-    };
+    let effective_base =
+        effective_direct_upstream_base(&parsed.path, anthropic_upstream_base, openai_upstream_base);
 
     let header_value = |name: &str| {
         parsed
@@ -1193,10 +1143,9 @@ async fn forward_direct_to_anthropic(
     };
 
     // A WebSocket/upgrade handshake needs its own path: Upgrade/Connection are
-    // hop-by-hop for the plain forward below, and Codex's current transport is
-    // WS on /v1/responses — a 501 here would hard-break Codex in exactly the
-    // bypass modes meant to keep it alive. Tunnel the upgrade via hyper's
-    // connection takeover instead.
+    // hop-by-hop in the plain forward below, and Codex's current transport uses
+    // WS on /v1/responses. Tunnel upgrade requests so bypass mode keeps those
+    // sessions alive instead of failing closed.
     if header_value("upgrade").is_some() {
         let url = format!("{}{}", effective_base, parsed.path);
         tunnel_upgrade_direct(client, &parsed, leftover_body, &url).await;
@@ -1323,10 +1272,6 @@ async fn forward_direct_to_anthropic(
     let _ = client.write_all(b"0\r\n\r\n").await;
 }
 
-/// Tunnel a WebSocket/upgrade handshake to the upstream through the shared
-/// reqwest client. hyper keeps the connection on a 101 and hands it over via
-/// `Response::upgrade()`, after which both sockets are spliced verbatim. Used
-/// by the bypass forwarder so gated/bypassed Codex WS sessions keep working.
 async fn tunnel_upgrade_direct(
     mut client: TcpStream,
     parsed: &ParsedRequestHead,
@@ -1334,10 +1279,13 @@ async fn tunnel_upgrade_direct(
     url: &str,
 ) {
     let method = match reqwest::Method::from_bytes(parsed.method.as_bytes()) {
-        Ok(m) => m,
+        Ok(method) => method,
         Err(_) => {
             let _ = client
-                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                .write_all(b"HTTP/1.1 400 Bad Request
+Content-Length: 0
+
+")
                 .await;
             return;
         }
@@ -1345,9 +1293,8 @@ async fn tunnel_upgrade_direct(
 
     let mut req = upstream_client().request(method, url);
     for (name, value) in &parsed.headers {
-        // Unlike the plain forward, Connection/Upgrade/Sec-WebSocket-* must
-        // survive: hyper needs the upgrade intent to keep the connection for
-        // takeover. Only strip what we rewrite ourselves.
+        // Unlike the plain forward path, Upgrade-related headers must survive
+        // so hyper can hand the socket over after the 101 response.
         if name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case("accept-encoding") {
             continue;
         }
@@ -1355,11 +1302,14 @@ async fn tunnel_upgrade_direct(
     }
 
     let resp = match req.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            log::warn!("proxy_intercept bypass upgrade forward failed: {e}");
+        Ok(resp) => resp,
+        Err(err) => {
+            log::warn!("proxy_intercept bypass upgrade forward failed: {err}");
             let _ = client
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .write_all(b"HTTP/1.1 502 Bad Gateway
+Content-Length: 0
+
+")
                 .await;
             return;
         }
@@ -1367,7 +1317,8 @@ async fn tunnel_upgrade_direct(
 
     let status = resp.status();
     let mut head = format!(
-        "HTTP/1.1 {} {}\r\n",
+        "HTTP/1.1 {} {}
+",
         status.as_u16(),
         status.canonical_reason().unwrap_or("")
     );
@@ -1375,14 +1326,15 @@ async fn tunnel_upgrade_direct(
         if name.as_str().eq_ignore_ascii_case("transfer-encoding") {
             continue;
         }
-        if let Ok(v) = value.to_str() {
-            head.push_str(&format!("{}: {}\r\n", name.as_str(), v));
+        if let Ok(value) = value.to_str() {
+            head.push_str(&format!("{}: {}
+", name.as_str(), value));
         }
     }
-    head.push_str("\r\n");
+    head.push_str("
+");
 
     if status != reqwest::StatusCode::SWITCHING_PROTOCOLS {
-        // Handshake refused — relay the upstream's verdict and close.
         let body = resp.bytes().await.unwrap_or_default();
         if client.write_all(head.as_bytes()).await.is_ok() {
             let _ = client.write_all(&body).await;
@@ -1391,23 +1343,38 @@ async fn tunnel_upgrade_direct(
     }
 
     let mut upstream = match resp.upgrade().await {
-        Ok(u) => u,
-        Err(e) => {
-            log::warn!("proxy_intercept bypass upgrade takeover failed: {e}");
+        Ok(upstream) => upstream,
+        Err(err) => {
+            log::warn!("proxy_intercept bypass upgrade takeover failed: {err}");
             let _ = client
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .write_all(b"HTTP/1.1 502 Bad Gateway
+Content-Length: 0
+
+")
                 .await;
             return;
         }
     };
+
     if client.write_all(head.as_bytes()).await.is_err() {
         return;
     }
-    // Frames the client sent before the handshake completed.
     if !leftover.is_empty() && upstream.write_all(leftover).await.is_err() {
         return;
     }
     let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+}
+
+fn effective_direct_upstream_base<'a>(
+    path: &str,
+    anthropic_upstream_base: &'a str,
+    openai_upstream_base: &'a str,
+) -> &'a str {
+    if is_openai_path(path) {
+        openai_upstream_base
+    } else {
+        anthropic_upstream_base
+    }
 }
 
 struct ParsedRequestHead {
@@ -1735,12 +1702,12 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bearer_value_changed, codex_error_summary, codex_snapshot_from_usage_payload,
-        codex_window_label, decode_codex_plan_tier, extract_bearer, extract_header_value,
-        find_header_end, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
-        is_local_proxy_path, is_openai_path, is_reportable_codex_error,
-        parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
-        read_http_headers, request_has_header, request_is_loopback_safe,
+        bearer_value_changed, codex_snapshot_from_usage_payload, codex_window_label,
+        decode_codex_plan_tier, effective_direct_upstream_base, extract_bearer,
+        extract_header_value, find_header_end, is_hop_by_hop_request_header,
+        is_hop_by_hop_response_header, is_local_proxy_path, is_openai_path,
+        is_reportable_codex_error, parse_codex_rate_limit_headers, parse_request_head,
+        parse_response_status, read_http_headers, request_has_header, request_is_loopback_safe,
         rewrite_use_responses_lite, run, set_response_content_length, stamp_codex_client_header,
         strip_request_header, BypassFlag, ModelsRewrite, SharedToken,
     };
@@ -1809,6 +1776,21 @@ mod tests {
         // Codex's own usage tracker endpoints stay local.
         assert!(is_local_proxy_path("/stats"));
         assert!(!is_openai_path("/stats"));
+    }
+
+    #[test]
+    fn direct_bypass_uses_configured_openai_upstream_for_codex_paths() {
+        let anthropic = "https://api.anthropic.com";
+        let openai = "https://openai-proxy.example/v1";
+
+        assert_eq!(
+            effective_direct_upstream_base("/v1/responses", anthropic, openai),
+            openai
+        );
+        assert_eq!(
+            effective_direct_upstream_base("/v1/messages", anthropic, openai),
+            anthropic
+        );
     }
 
     #[test]
@@ -1962,7 +1944,8 @@ mod tests {
         drop(intercept_listener); // free the port; run() rebinds the same one
         let slot_for_run = token_slot.clone();
         let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
-        let upstream_base = Arc::new("https://api.anthropic.com".to_string());
+        let anthropic_upstream_base = Arc::new("https://api.anthropic.com".to_string());
+        let openai_upstream_base = Arc::new("https://api.openai.com".to_string());
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
         let run_task = tokio::spawn(async move {
             // run() loops forever; the test cancels it via abort below.
@@ -1975,7 +1958,8 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
-                upstream_base,
+                anthropic_upstream_base,
+                openai_upstream_base,
             )
             .await;
         });
@@ -2037,13 +2021,13 @@ mod tests {
     #[serial(backend_port)]
     async fn intercept_falls_back_direct_when_backend_is_unreachable() {
         // Pick a backend port that nothing is listening on. Bind+immediately
-        // drop a listener to grab a free port, then connect attempts will fail.
+        // drop listener to grab a free port, then connect attempts will fail.
         let (probe, dead_backend_addr) = bind_ephemeral().await;
         drop(probe);
         backend_port::set(dead_backend_addr.port());
 
-        // Mock upstream: answers 200 to whatever arrives. API traffic must
-        // land here (per-request direct fallback) instead of getting a 502.
+        // Mock upstream: answers 200 to prove we fell back to the native
+        // provider instead of returning 502.
         let (upstream_listener, upstream_addr) = bind_ephemeral().await;
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = upstream_listener.accept().await {
@@ -2052,7 +2036,11 @@ mod tests {
                     let _ = sock.read(&mut buf).await;
                     let _ = sock
                         .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            b"HTTP/1.1 200 OK
+Content-Length: 2
+Connection: close
+
+ok",
                         )
                         .await;
                 });
@@ -2067,7 +2055,8 @@ mod tests {
         drop(intercept_listener);
         let slot_for_run = token_slot.clone();
         let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
-        let upstream_base = Arc::new(format!("http://127.0.0.1:{}", upstream_addr.port()));
+        let anthropic_upstream_base = Arc::new(format!("http://127.0.0.1:{}", upstream_addr.port()));
+        let openai_upstream_base = Arc::new("https://api.openai.com".to_string());
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
         let run_task = tokio::spawn(async move {
             let _ = run(
@@ -2079,29 +2068,11 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
-                upstream_base,
+                anthropic_upstream_base,
+                openai_upstream_base,
             )
             .await;
         });
-
-        let read_response = |mut client: TcpStream| async move {
-            let mut response = Vec::new();
-            let mut tmp = [0u8; 256];
-            let _ = timeout(Duration::from_secs(5), async {
-                loop {
-                    let n = client.read(&mut tmp).await.unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    response.extend_from_slice(&tmp[..n]);
-                    if response.len() >= 16 {
-                        break;
-                    }
-                }
-            })
-            .await;
-            response
-        };
 
         let mut client = None;
         for _ in 0..50 {
@@ -2112,37 +2083,38 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let mut client = client.expect("intercept reachable");
-
         let request = format!(
-            "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 0\r\n\r\n",
+            "POST /v1/messages HTTP/1.1
+Host: 127.0.0.1:{}
+Content-Length: 0
+
+",
             intercept_addr.port()
         );
         client
             .write_all(request.as_bytes())
             .await
             .expect("write request");
-        let response = read_response(client).await;
-        let response_str = std::str::from_utf8(&response).unwrap_or("");
+
+        let mut response = Vec::new();
+        let mut tmp = [0u8; 256];
+        let _ = timeout(Duration::from_secs(2), async {
+            loop {
+                let n = client.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                response.extend_from_slice(&tmp[..n]);
+                if response.len() >= 16 {
+                    break;
+                }
+            }
+        })
+        .await;
+        let response_str = String::from_utf8_lossy(&response);
         assert!(
             response_str.starts_with("HTTP/1.1 200"),
-            "expected direct-to-upstream 200 fallback, got: {response_str:?}"
-        );
-
-        // Local proxy paths (health probes, stats) must NOT leak upstream on
-        // fallback: the boot-time readyz poll would otherwise flap green and
-        // real probes would generate provider traffic every 250ms.
-        let mut probe_client = TcpStream::connect(intercept_addr)
-            .await
-            .expect("probe connect");
-        probe_client
-            .write_all(b"GET /readyz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-            .await
-            .expect("write probe");
-        let response = read_response(probe_client).await;
-        let response_str = std::str::from_utf8(&response).unwrap_or("");
-        assert!(
-            response_str.starts_with("HTTP/1.1 503"),
-            "expected local 503 for /readyz on fallback, got: {response_str:?}"
+            "expected direct fallback response, got {response_str:?}"
         );
 
         run_task.abort();
@@ -2423,7 +2395,8 @@ mod tests {
         // Bypass means we never actually contact the backend; pin to an
         // unused loopback port so any accidental connect would fail fast.
         backend_port::set(1);
-        let upstream_base_arc = Arc::new(upstream_base);
+        let anthropic_upstream_base = Arc::new(upstream_base.clone());
+        let openai_upstream_base = Arc::new("https://api.openai.com".to_string());
         let token_for_run = token_slot.clone();
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
         let run_task = tokio::spawn(async move {
@@ -2436,7 +2409,8 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
-                upstream_base_arc,
+                anthropic_upstream_base,
+                openai_upstream_base,
             )
             .await;
         });
@@ -2568,7 +2542,8 @@ mod tests {
         drop(intercept_listener);
         let bypass: BypassFlag = Arc::new(AtomicBool::new(true));
         backend_port::set(1);
-        let upstream_base_arc = Arc::new(upstream_base);
+        let anthropic_upstream_base = Arc::new(upstream_base.clone());
+        let openai_upstream_base = Arc::new("https://api.openai.com".to_string());
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
         let run_task = tokio::spawn(async move {
             let _ = run(
@@ -2580,7 +2555,8 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
-                upstream_base_arc,
+                anthropic_upstream_base,
+                openai_upstream_base,
             )
             .await;
         });
@@ -2663,7 +2639,8 @@ mod tests {
         let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
         drop(intercept_listener);
         let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
-        let upstream_base = Arc::new("https://api.anthropic.com".to_string());
+        let anthropic_upstream_base = Arc::new("https://api.anthropic.com".to_string());
+        let openai_upstream_base = Arc::new("https://api.openai.com".to_string());
         let token_for_run = token_slot.clone();
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
         let run_task = tokio::spawn(async move {
@@ -2676,7 +2653,8 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
-                upstream_base,
+                anthropic_upstream_base,
+                openai_upstream_base,
             )
             .await;
         });
@@ -2998,7 +2976,8 @@ mod tests {
         drop(intercept_listener);
         let slot_for_run = token_slot.clone();
         let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
-        let upstream_base = Arc::new("https://api.anthropic.com".to_string());
+        let anthropic_upstream_base = Arc::new("https://api.anthropic.com".to_string());
+        let openai_upstream_base = Arc::new("https://api.openai.com".to_string());
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
         let run_task = tokio::spawn(async move {
             let _ = run(
@@ -3010,7 +2989,8 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
-                upstream_base,
+                anthropic_upstream_base,
+                openai_upstream_base,
             )
             .await;
         });
@@ -3073,128 +3053,6 @@ mod tests {
         run_task.abort();
         backend_task.abort();
         backend_port::reset_for_tests();
-    }
-
-    #[tokio::test]
-    #[serial(backend_port)]
-    async fn intercept_skips_models_rewrite_for_anthropic_fetch() {
-        // Same catalog shape, but the request carries Anthropic markers —
-        // the Codex-only lite-flag rewrite must leave it untouched.
-        let models_json = br#"{"models":[{"slug":"gpt-5.5","use_responses_lite":true}]}"#.to_vec();
-        let (backend_listener, backend_addr) = bind_ephemeral().await;
-        let backend_task = tokio::spawn(async move {
-            let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
-            let _ = read_until_header_end(&mut sock).await;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                models_json.len()
-            );
-            let _ = sock.write_all(response.as_bytes()).await;
-            let _ = sock.write_all(&models_json).await;
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        });
-
-        backend_port::set(backend_addr.port());
-
-        let token_slot: SharedToken = Arc::new(Mutex::new(None));
-        let intercept_listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("intercept bind");
-        let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
-        drop(intercept_listener);
-        let slot_for_run = token_slot.clone();
-        let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
-        let upstream_base = Arc::new("https://api.anthropic.com".to_string());
-        let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
-        let run_task = tokio::spawn(async move {
-            let _ = run(
-                intercept_addr,
-                slot_for_run,
-                Arc::new(Mutex::new(None)),
-                Arc::new(Mutex::new(None)),
-                bypass_for_run,
-                Arc::new(AtomicBool::new(false)),
-                Arc::new(AtomicBool::new(false)),
-                fresh_bearer_tx,
-                upstream_base,
-            )
-            .await;
-        });
-
-        let mut client = None;
-        for _ in 0..50 {
-            if let Ok(c) = TcpStream::connect(intercept_addr).await {
-                client = Some(c);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let mut client = client.expect("intercept reachable");
-
-        let request = format!(
-            "GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nanthropic-version: 2023-06-01\r\n\r\n",
-            intercept_addr.port()
-        );
-        client
-            .write_all(request.as_bytes())
-            .await
-            .expect("write request");
-
-        let mut response = Vec::new();
-        let mut tmp = [0u8; 4096];
-        let _ = timeout(Duration::from_secs(2), async {
-            loop {
-                match client.read(&mut tmp).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        response.extend_from_slice(&tmp[..n]);
-                        if let Some(end) = find_header_end(&response) {
-                            if serde_json::from_slice::<serde_json::Value>(&response[end + 4..])
-                                .is_ok()
-                            {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        })
-        .await;
-
-        let end = find_header_end(&response).expect("response head complete");
-        let body: serde_json::Value =
-            serde_json::from_slice(&response[end + 4..]).expect("json body");
-        assert_eq!(
-            body["models"][0]["use_responses_lite"],
-            serde_json::Value::Bool(true),
-            "anthropic-marked models fetch must pass through unrewritten: {body}"
-        );
-
-        run_task.abort();
-        backend_task.abort();
-        backend_port::reset_for_tests();
-    }
-
-    #[test]
-    fn codex_error_summary_extracts_structural_fields_only() {
-        let body = br#"{"error":{"message":"Invalid prompt: SECRET user content here","type":"invalid_request_error","param":"messages","code":"invalid_prompt"}}"#;
-        let summary = codex_error_summary(body);
-        assert_eq!(
-            summary,
-            "type=invalid_request_error code=invalid_prompt param=messages"
-        );
-        assert!(
-            !summary.contains("SECRET"),
-            "free-text message must never reach Sentry: {summary}"
-        );
-    }
-
-    #[test]
-    fn codex_error_summary_handles_non_json() {
-        assert_eq!(
-            codex_error_summary(b"<html>gateway error</html>"),
-            "unparseable error body (26 bytes)"
-        );
     }
 
     #[test]

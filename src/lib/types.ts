@@ -118,6 +118,18 @@ export interface DashboardState {
   termsUrl: string;
 }
 
+export interface DeepSeekBalanceInfo {
+  currency: string;
+  totalBalance: string;
+  grantedBalance: string;
+  toppedUpBalance: string;
+}
+
+export interface DeepSeekBalanceResponse {
+  isAvailable: boolean;
+  balanceInfos: DeepSeekBalanceInfo[];
+}
+
 export interface BootstrapProgress {
   running: boolean;
   complete: boolean;

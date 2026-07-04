@@ -4240,5 +4240,4 @@ mod tests {
         let claude = empty_claude_profile(ClaudePlanTier::Max20x);
         assert!(detect_tier_mismatch(&account, &claude, None).is_none());
     }
-
 }

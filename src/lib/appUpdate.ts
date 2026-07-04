@@ -77,7 +77,8 @@ export async function runAppUpdateCheck({
       return {
         availableUpdate: update,
         readyToRestart: false,
-        ...(shouldShowDialog ? { showDialog: true } : {}),
+        // don't show dialog
+        ...(shouldShowDialog ? { showDialog: false } : {}),
         statusCopy: `Update available: ${update.version}.`,
       };
     }
@@ -149,13 +150,13 @@ export async function maybeFireStaleAppUpdateNotification(
   }
 
   try {
-    await invokeFn("show_notification", {
-      title: "Headroom update waiting",
-      body: `Headroom ${availableUpdate.version} has been out for ${Math.floor(
-        ageDays
-      )} days. Open Headroom to install it.`,
-      action: "update",
-    });
+    // await invokeFn("show_notification", {
+    //   title: "Headroom update waiting",
+    //   body: `Headroom ${availableUpdate.version} has been out for ${Math.floor(
+    //     ageDays
+    //   )} days. Open Headroom to install it.`,
+    //   action: "update",
+    // });
     localStorage.setItem(STALE_UPDATE_NOTIFIED_KEY, availableUpdate.version);
   } catch {
     // best-effort

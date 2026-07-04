@@ -156,6 +156,7 @@ import type {
   ClientSetupResult,
   DailySavingsPoint,
   DashboardState,
+  DeepSeekBalanceResponse,
   HeadroomLearnPrereqStatus,
   HeadroomLearnStatus,
   HeadroomSubscriptionTier,
@@ -326,6 +327,23 @@ async function loadDashboard(): Promise<DashboardState> {
     return await invoke<DashboardState>("get_dashboard_state");
   } catch {
     return mockDashboard;
+  }
+}
+
+function formatNamedCurrency(value: string, currency: string): string {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return `${currency} ${value}`;
+  }
+  try {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    }).format(numeric);
+  } catch {
+    return `${currency} ${value}`;
   }
 }
 
@@ -1047,7 +1065,10 @@ export default function App() {
   const [activityFeedLoaded, setActivityFeedLoaded] = useState(false);
   // Tray window focus proxies for visibility: the window auto-hides on blur
   // via `triggerHide`, so "not focused" ⇒ "hidden" for polling purposes.
-  const [trayWindowFocused, setTrayWindowFocused] = useState(true);
+ const [trayWindowFocused, setTrayWindowFocused] = useState(true);
+ const [deepseekBalance, setDeepseekBalance] = useState<DeepSeekBalanceResponse | null>(null);
+ const [deepseekBalanceLoading, setDeepseekBalanceLoading] = useState(false);
+ const [deepseekBalanceError, setDeepseekBalanceError] = useState<string | null>(null);
   // Sticky flag: the user has visited a heavy-data tab (Activity or Optimize)
   // at least once this session. The tray-focus pre-warm is gated on this so
   // users who stay on Home don't pay its IPC/subprocess cost on every focus.
@@ -1155,11 +1176,18 @@ export default function App() {
     pricingStatus?.account?.subscriptionStartedAt,
     pricingStatus?.account?.subscriptionDiscountDuration,
     pricingStatus?.account?.subscriptionDiscountDurationInMonths,
-    pricingStatus?.account?.subscriptionCancelAtPeriodEnd ?? false,
-    pricingStatus?.account?.subscriptionEndsAt,
-    pricingStatus?.activePercentOff ?? 0
-  );
-  const contactEmailValid = isValidEmailAddress(contactEmail);
+pricingStatus?.account?.subscriptionCancelAtPeriodEnd ?? false,
+pricingStatus?.account?.subscriptionEndsAt,
+pricingStatus?.activePercentOff ?? 0
+);
+const primaryDeepseekBalance =
+  deepseekBalance?.balanceInfos.find((entry) => entry.currency === "CNY") ??
+  deepseekBalance?.balanceInfos[0] ??
+  null;
+const deepseekBalanceValue = primaryDeepseekBalance
+  ? formatNamedCurrency(primaryDeepseekBalance.totalBalance, primaryDeepseekBalance.currency)
+  : null;
+const contactEmailValid = isValidEmailAddress(contactEmail);
   const authEmailValid = isValidEmailAddress(authEmail);
   const showInstallProgress =
     bootstrapping ||
@@ -1922,6 +1950,46 @@ export default function App() {
 
     refreshDashboard();
     const interval = window.setInterval(refreshDashboard, 5000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [activeView, trayWindowFocused]);
+
+  useEffect(() => {
+    if (activeView !== "home") {
+      return;
+    }
+
+    let active = true;
+    const refreshDeepseekBalance = () => {
+      setDeepseekBalanceLoading(true);
+      void invoke<DeepSeekBalanceResponse>("get_deepseek_balance")
+        .then((next) => {
+          if (!active) return;
+          setDeepseekBalance(next);
+          setDeepseekBalanceError(null);
+        })
+        .catch((error) => {
+          if (!active) return;
+          setDeepseekBalanceError(
+            describeInvokeError(error, "Could not load DeepSeek balance.")
+          );
+        })
+        .finally(() => {
+          if (!active) return;
+          setDeepseekBalanceLoading(false);
+        });
+    };
+
+    refreshDeepseekBalance();
+    if (!trayWindowFocused) {
+      return () => {
+        active = false;
+      };
+    }
+
+    const interval = window.setInterval(refreshDeepseekBalance, 60_000);
     return () => {
       active = false;
       window.clearInterval(interval);
@@ -4762,6 +4830,53 @@ export default function App() {
                 );
               })()}
             </section>
+
+
+<section>
+<article className="soft-card stat-card deepseek-balance-card">
+<span className="stat-card__label">
+<CurrencyDollar aria-hidden="true" className="stat-card__icon" size={15} weight="bold" />
+DeepSeek balance
+</span>
+<button
+type="button"
+className="deepseek-balance-card__value-button"
+onClick={() => {
+setDeepseekBalanceLoading(true);
+void invoke<DeepSeekBalanceResponse>("get_deepseek_balance")
+.then((next) => {
+setDeepseekBalance(next);
+setDeepseekBalanceError(null);
+})
+.catch((error) => {
+setDeepseekBalanceError(
+describeInvokeError(error, "Could not load DeepSeek balance.")
+);
+})
+.finally(() => {
+setDeepseekBalanceLoading(false);
+});
+}}
+disabled={deepseekBalanceLoading}
+title="Refresh DeepSeek balance"
+>
+<strong className="stat-value--green">
+{deepseekBalanceValue ?? (deepseekBalanceLoading ? "Loading…" : "Unavailable")}
+</strong>
+</button>
+{primaryDeepseekBalance ? (
+<p className="deepseek-balance-card__meta">
+Top-up {formatNamedCurrency(primaryDeepseekBalance.toppedUpBalance, primaryDeepseekBalance.currency)}
+{" · "}
+Granted {formatNamedCurrency(primaryDeepseekBalance.grantedBalance, primaryDeepseekBalance.currency)}
+</p>
+) : deepseekBalanceError ? (
+<p className="deepseek-balance-card__error" role="status">{deepseekBalanceError}</p>
+) : (
+<p className="deepseek-balance-card__meta">Checking your DeepSeek account…</p>
+)}
+</article>
+</section>
 
             <section className="stat-grid stat-grid--2col">
               <article

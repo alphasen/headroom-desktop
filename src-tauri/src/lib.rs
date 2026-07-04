@@ -52,9 +52,10 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 use crate::models::{
     ActivityFeedResponse, BillingPeriod, BootstrapProgress, ClaudeAccountProfile,
     ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus, ClientSetupResult,
-    ClientSetupVerification, DailySavingsPoint, DashboardState, HeadroomAuthCodeRequest,
-    HeadroomLearnPrereqStatus, HeadroomLearnStatus, HeadroomPricingStatus,
-    HeadroomSubscriptionTier, RuntimeStatus, RuntimeUpgradeProgress, TransformationFeedResponse,
+    ClientSetupVerification, DailySavingsPoint, DashboardState, DeepSeekBalanceResponse,
+    HeadroomAuthCodeRequest, HeadroomLearnPrereqStatus, HeadroomLearnStatus,
+    HeadroomPricingStatus, HeadroomSubscriptionTier, RuntimeStatus, RuntimeUpgradeProgress,
+    TransformationFeedResponse,
 };
 use crate::state::AppState;
 
@@ -357,7 +358,107 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
         dashboard
     })
     .await
-    .map_err(|err| err.to_string())
+.map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn get_deepseek_balance() -> Result<DeepSeekBalanceResponse, String> {
+    tauri::async_runtime::spawn_blocking(fetch_deepseek_balance)
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn fetch_deepseek_balance() -> Result<DeepSeekBalanceResponse, String> {
+    let token = resolve_deepseek_token()?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|err| format!("Could not create DeepSeek client: {err}"))?;
+    let response = client
+        .get("https://api.deepseek.com/user/balance")
+        .header("Accept", "application/json")
+        .bearer_auth(token)
+        .send()
+        .map_err(|err| format!("Could not reach DeepSeek: {err}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        let detail = body.trim().chars().take(200).collect::<String>();
+        return Err(if detail.is_empty() {
+            format!("DeepSeek returned {status}.")
+        } else {
+            format!("DeepSeek returned {status}: {detail}")
+        });
+    }
+    response
+        .json::<DeepSeekBalanceResponse>()
+        .map_err(|err| format!("Could not parse DeepSeek balance: {err}"))
+}
+
+fn resolve_deepseek_token() -> Result<String, String> {
+    for key in ["DEEPSEEK_TOKEN", "DEEPSEEK_API_KEY"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Ok(trimmed.to_string());
+            }
+        }
+    }
+
+    let home = dirs::home_dir().ok_or_else(|| "Could not resolve home directory.".to_string())?;
+    for profile in [".zshrc", ".bashrc", ".bash_profile", ".profile"] {
+        let path = home.join(profile);
+        if let Some(token) = extract_deepseek_token_from_profile(&path) {
+            return Ok(token);
+        }
+    }
+
+    Err("DeepSeek token not found in environment or shell profiles.".to_string())
+}
+
+fn extract_deepseek_token_from_profile(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        for key in ["DEEPSEEK_TOKEN", "DEEPSEEK_API_KEY"] {
+            let export_prefix = format!("export {key}=");
+            if let Some(value) = line.strip_prefix(&export_prefix) {
+                if let Some(token) = normalize_shell_assignment_value(value) {
+                    return Some(token);
+                }
+            }
+            let plain_prefix = format!("{key}=");
+            if let Some(value) = line.strip_prefix(&plain_prefix) {
+                if let Some(token) = normalize_shell_assignment_value(value) {
+                    return Some(token);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn normalize_shell_assignment_value(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let unquoted = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    let token = unquoted.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
 }
 
 #[tauri::command]
@@ -3486,11 +3587,12 @@ pub fn run() {
         .on_window_event(|window, event| handle_window_event(window, event))
         .manage(state)
         .manage(PendingAppUpdate(Mutex::new(None)))
-        .invoke_handler(tauri::generate_handler![
-            get_dashboard_state,
-            get_app_update_configuration,
-            check_for_app_update,
-            install_app_update,
+.invoke_handler(tauri::generate_handler![
+get_dashboard_state,
+get_deepseek_balance,
+get_app_update_configuration,
+check_for_app_update,
+install_app_update,
             restart_app,
             show_app_update_notification,
             show_notification,

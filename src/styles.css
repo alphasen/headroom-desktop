@@ -2144,6 +2144,31 @@ select {
   line-height: 1;
 }
 
+.deepseek-balance-card {
+  gap: 10px;
+  min-height: 0;
+}
+
+.deepseek-balance-card__value-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.deepseek-balance-card__value-button:disabled {
+  cursor: progress;
+}
+
+.deepseek-balance-card__meta {
+  color: #675e58;
+}
+
+.deepseek-balance-card__error {
+  color: #b25543;
+}
+
 .stat-label-sep {
   opacity: 0.4;
 }

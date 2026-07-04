@@ -142,11 +142,9 @@ fn build_rtk_codex_nudge(managed_rtk_path: &Path) -> String {
 }
 
 pub fn rtk_integration_status() -> Result<(bool, bool)> {
-    let path_configured = shell_block_contains_text_in_files(
-        &resolve_default_shell_targets(),
-        "managed_rtk",
-        "export PATH=",
-    )?;
+    // rtk is invoked by absolute path in the Claude hook; the binary just
+    // needs to exist — no shell PATH export required.
+    let path_configured = default_headroom_rtk_path().exists();
     let hook_configured = claude_settings_hook_matches("headroom-rtk-rewrite.sh")?
         && headroom_rtk_hook_path().exists();
     Ok((path_configured, hook_configured))
@@ -213,6 +211,21 @@ fn shell_step_best_effort(
     }
 }
 
+/// Build the managed shell block body for Claude Code. Always exports
+/// `ANTHROPIC_BASE_URL` pointing at the Headroom proxy. When
+/// `HEADROOM_ANTHROPIC_UPSTREAM` is set in the current environment, also
+/// exports it so the proxy picks it up on next launch.
+fn build_claude_code_shell_block() -> String {
+    let mut block = format!("export ANTHROPIC_BASE_URL={}", HEADROOM_ANTHROPIC_BASE_URL);
+    if let Ok(upstream) = std::env::var("HEADROOM_ANTHROPIC_UPSTREAM") {
+        block.push_str(&format!(
+            "\nexport HEADROOM_ANTHROPIC_UPSTREAM={}",
+            upstream
+        ));
+    }
+    block
+}
+
 pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
     let mut changed_files = Vec::new();
     let mut backup_files = Vec::new();
@@ -240,7 +253,7 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
 
             // Shell profile (RTK PATH + env export) is convenience; tolerate an
             // unwritable profile rather than failing the whole setup.
-            let env_block = format!("export ANTHROPIC_BASE_URL={}", HEADROOM_ANTHROPIC_BASE_URL);
+            let env_block = build_claude_code_shell_block();
             let shell_step = ensure_rtk_integrations_for_targets(
                 &default_headroom_rtk_path(),
                 &default_headroom_managed_python_path(),
@@ -372,8 +385,8 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                 "ANTHROPIC_BASE_URL",
                 HEADROOM_ANTHROPIC_BASE_URL,
             )?;
-            let rtk_path_ok =
-                shell_block_contains_text_in_files(&shell_targets, "managed_rtk", "export PATH=")?;
+            // rtk is called by absolute path in the hook; no shell PATH export needed.
+            let rtk_path_ok = default_headroom_rtk_path().exists();
             let claude_settings_ok =
                 claude_settings_env_matches("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)?;
             let rtk_hook_ok = claude_settings_hook_matches("headroom-rtk-rewrite.sh")?
@@ -385,7 +398,7 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                 );
             }
             if rtk_path_ok {
-                checks.push("Found Headroom-managed RTK PATH export in shell profiles.".into());
+                checks.push("Found Headroom-managed rtk binary.".into());
             }
             if claude_settings_ok {
                 checks.push(
@@ -412,9 +425,7 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             // disabled it — routing is what "connected" means here.
             let rtk_required = !state.rtk_disabled && default_headroom_rtk_path().exists();
             if rtk_required && !rtk_path_ok {
-                failures.push(
-                    "Headroom-managed RTK PATH export was not found in shell profiles.".into(),
-                );
+                failures.push("Headroom-managed rtk binary was not found.".into());
             }
             if rtk_required && !rtk_hook_ok {
                 failures.push(
@@ -576,8 +587,7 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             let shell_targets = resolve_client_shell_targets_for_cleanup(&state, client_id)?;
             remove_shell_block(&shell_targets, "claude_code")?;
             // Also drop the managed_rtk PATH block so `rtk` isn't exported from
-            // shell profiles after quit — otherwise the user's next shell still
-            // has Headroom binaries shadowing whatever's on PATH.
+            // shell profiles after quit.
             remove_shell_block(&shell_targets, "managed_rtk")?;
             remove_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)?;
             let _ = remove_legacy_vscode_base_url_keys()?;
@@ -1230,22 +1240,16 @@ fn configure_shell_block(
     Ok((changed, backups))
 }
 
+/// Clean up old-style PATH-export shell blocks from previous versions.
+/// rtk is called by absolute path in the Claude Code hook, so no shell
+/// PATH configuration is needed.
 fn ensure_managed_rtk_on_path(
-    rtk_path: &Path,
+    _rtk_path: &Path,
     shell_targets: &[PathBuf],
 ) -> Result<(Vec<String>, Vec<String>)> {
-    let managed_bin_dir = rtk_path.parent().ok_or_else(|| {
-        anyhow!(
-            "managed RTK path {} is missing a parent directory",
-            rtk_path.display()
-        )
-    })?;
-    let path_value = shell_double_quote(&managed_bin_dir.to_string_lossy());
-    configure_shell_block(
-        shell_targets,
-        "managed_rtk",
-        &format!("export PATH=\"{path_value}:$PATH\""),
-    )
+    // Remove legacy managed_rtk PATH blocks written by older versions.
+    let _ = remove_shell_block(shell_targets, "managed_rtk");
+    Ok((Vec::new(), Vec::new()))
 }
 
 fn ensure_claude_code_rtk_hook(
@@ -5351,15 +5355,18 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "hook script byte-stable"
         );
 
-        // Sanity: each managed block still appears exactly once.
+        // Sanity: claude_code managed block still appears exactly once.
         let combined = format!("{zshrc_after_second}\n{zshenv_after_second}");
         assert_eq!(
             combined.matches("# >>> headroom:claude_code >>>").count(),
             1
         );
+        // managed_rtk blocks from older versions are cleaned up during apply;
+        // rtk is called by absolute path in the hook, so no PATH export is needed.
         assert_eq!(
             combined.matches("# >>> headroom:managed_rtk >>>").count(),
-            1
+            0,
+            "managed_rtk shell blocks should NOT be created — rtk uses absolute paths"
         );
     }
 

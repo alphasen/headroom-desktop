@@ -98,7 +98,7 @@ describe("app update helpers", () => {
     expect(result).toEqual({
       availableUpdate,
       readyToRestart: false,
-      showDialog: true,
+      showDialog: false,
       statusCopy: "Update available: 0.3.0.",
     });
   });
