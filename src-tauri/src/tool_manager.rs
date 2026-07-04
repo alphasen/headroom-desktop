@@ -223,6 +223,18 @@ fn pre_upstream_concurrency() -> usize {
     (cores * 2).clamp(8, 32)
 }
 
+fn anthropic_target_api_url_env() -> Option<String> {
+    for key in ["ANTHROPIC_TARGET_API_URL", "HEADROOM_ANTHROPIC_UPSTREAM"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn parse_major_minor_patch(s: &str) -> Option<(u32, u32, u32)> {
     let head = s.split(|c: char| c == '-' || c == '+').next()?;
     let mut parts = head.split('.');
@@ -884,7 +896,8 @@ impl ToolManager {
                 // agents a too-niced backend gets starved enough that even the
                 // watchdog's tolerant 5s re-probe misses, triggering spurious
                 // auto-pause. +2 still yields, without the starvation.
-                let mut child = Command::new("/usr/bin/nice")
+                let mut command = Command::new("/usr/bin/nice");
+                command
                     .arg("-n")
                     .arg("2")
                     .arg(executable)
@@ -990,7 +1003,13 @@ impl ToolManager {
                     .env(
                         "HEADROOM_ANTHROPIC_PRE_UPSTREAM_CONCURRENCY",
                         pre_upstream_concurrency().to_string(),
-                    )
+                    );
+
+                if let Some(url) = anthropic_target_api_url_env() {
+                    command.env("ANTHROPIC_TARGET_API_URL", url);
+                }
+
+                let mut child = command
                     .stdin(Stdio::null())
                     .stdout(Stdio::from(
                         log_file

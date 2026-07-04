@@ -200,23 +200,28 @@ pub struct DashboardState {
     /// Highest terms version this user has already accepted (0 = none).
     pub accepted_terms_version: u32,
     /// Canonical Terms-of-Service URL the acceptance gate links to.
-pub terms_url: String,
+    pub terms_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeepSeekBalanceInfo {
- pub currency: String,
- pub total_balance: String,
- pub granted_balance: String,
- pub topped_up_balance: String,
+    pub currency: String,
+    #[serde(alias = "total_balance")]
+    pub total_balance: String,
+    #[serde(alias = "granted_balance")]
+    pub granted_balance: String,
+    #[serde(alias = "topped_up_balance")]
+    pub topped_up_balance: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeepSeekBalanceResponse {
- pub is_available: bool,
- pub balance_infos: Vec<DeepSeekBalanceInfo>,
+    #[serde(alias = "is_available")]
+    pub is_available: bool,
+    #[serde(alias = "balance_infos")]
+    pub balance_infos: Vec<DeepSeekBalanceInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1017,6 +1022,30 @@ pub struct HeadroomAuthCodeRequest {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn deepseek_balance_accepts_snake_case_and_serializes_camel_case() {
+        let parsed: DeepSeekBalanceResponse = serde_json::from_value(json!({
+            "is_available": true,
+            "balance_infos": [{
+                "currency": "USD",
+                "total_balance": "12.34",
+                "granted_balance": "1.00",
+                "topped_up_balance": "11.34"
+            }]
+        }))
+        .unwrap();
+
+        assert!(parsed.is_available);
+        assert_eq!(parsed.balance_infos.len(), 1);
+        assert_eq!(parsed.balance_infos[0].total_balance, "12.34");
+
+        let value = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(value["isAvailable"], json!(true));
+        assert_eq!(value["balanceInfos"][0]["totalBalance"], json!("12.34"));
+        assert!(value.get("is_available").is_none());
+        assert!(value.get("balance_infos").is_none());
+    }
 
     #[test]
     fn codex_plan_tier_round_trips_as_snake_case() {

@@ -262,6 +262,27 @@ fn bearer_value_changed(slot: &SharedToken, candidate: &str) -> bool {
         .unwrap_or(true)
 }
 
+fn capture_bearer_token(
+    token_slot: &SharedToken,
+    codex_plan_slot: &CodexPlanSlot,
+    fresh_bearer_tx: &FreshBearerNotifier,
+    token: String,
+    is_codex: bool,
+) {
+    if is_codex {
+        if let Some(tier) = decode_codex_plan_tier(&token) {
+            *codex_plan_slot.lock() = Some(tier);
+        }
+        return;
+    }
+
+    let changed = bearer_value_changed(token_slot, &token);
+    *token_slot.lock() = Some(BearerToken::new(token));
+    if changed {
+        let _ = fresh_bearer_tx.send(());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle(
     mut client: TcpStream,
@@ -334,17 +355,23 @@ async fn handle(
     // identity with headroom-web. The send is non-blocking; the actual
     // OAuth-profile fetch happens off the request hot path.
     if let Some(token) = extract_bearer(&buf) {
-        let changed = bearer_value_changed(&token_slot, &token);
-        // For Codex requests the bearer is an OpenAI OAuth JWT carrying the
-        // ChatGPT plan; decode it so the Codex gate can recommend a tier.
         if is_codex {
             if let Some(tier) = decode_codex_plan_tier(&token) {
                 *codex_plan_slot.lock() = Some(tier);
             }
-        }
-        *token_slot.lock() = Some(BearerToken::new(token));
-        if changed {
-            let _ = fresh_bearer_tx.send(());
+        } else {
+            let changed = bearer_value_changed(&token_slot, &token);
+            // For Codex requests the bearer is an OpenAI OAuth JWT carrying the
+            // ChatGPT plan; decode it so the Codex gate can recommend a tier.
+            if is_codex {
+                if let Some(tier) = decode_codex_plan_tier(&token) {
+                    *codex_plan_slot.lock() = Some(tier);
+                }
+            }
+            *token_slot.lock() = Some(BearerToken::new(token));
+            if changed {
+                let _ = fresh_bearer_tx.send(());
+            }
         }
     }
 
@@ -1207,12 +1234,19 @@ async fn forward_direct_to_upstream(
         }
     };
 
+    let auth_override = direct_anthropic_auth_override(&parsed.path, effective_base);
     let mut req = upstream_client().request(method, &url);
     for (name, value) in &parsed.headers {
         if is_hop_by_hop_request_header(name) {
             continue;
         }
+        if auth_override.is_some() && is_anthropic_auth_header(name) {
+            continue;
+        }
         req = req.header(name, value);
+    }
+    if let Some(token) = auth_override {
+        req = req.header("Authorization", format!("Bearer {token}"));
     }
     if !body.is_empty() {
         req = req.body(body);
@@ -1282,10 +1316,7 @@ async fn tunnel_upgrade_direct(
         Ok(method) => method,
         Err(_) => {
             let _ = client
-                .write_all(b"HTTP/1.1 400 Bad Request
-Content-Length: 0
-
-")
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
                 .await;
             return;
         }
@@ -1306,10 +1337,7 @@ Content-Length: 0
         Err(err) => {
             log::warn!("proxy_intercept bypass upgrade forward failed: {err}");
             let _ = client
-                .write_all(b"HTTP/1.1 502 Bad Gateway
-Content-Length: 0
-
-")
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
                 .await;
             return;
         }
@@ -1317,8 +1345,7 @@ Content-Length: 0
 
     let status = resp.status();
     let mut head = format!(
-        "HTTP/1.1 {} {}
-",
+        "HTTP/1.1 {} {}\r\n",
         status.as_u16(),
         status.canonical_reason().unwrap_or("")
     );
@@ -1327,12 +1354,10 @@ Content-Length: 0
             continue;
         }
         if let Ok(value) = value.to_str() {
-            head.push_str(&format!("{}: {}
-", name.as_str(), value));
+            head.push_str(&format!("{}: {}\r\n", name.as_str(), value));
         }
     }
-    head.push_str("
-");
+    head.push_str("\r\n");
 
     if status != reqwest::StatusCode::SWITCHING_PROTOCOLS {
         let body = resp.bytes().await.unwrap_or_default();
@@ -1347,10 +1372,7 @@ Content-Length: 0
         Err(err) => {
             log::warn!("proxy_intercept bypass upgrade takeover failed: {err}");
             let _ = client
-                .write_all(b"HTTP/1.1 502 Bad Gateway
-Content-Length: 0
-
-")
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
                 .await;
             return;
         }
@@ -1375,6 +1397,31 @@ fn effective_direct_upstream_base<'a>(
     } else {
         anthropic_upstream_base
     }
+}
+
+fn direct_anthropic_auth_override(path: &str, upstream_base: &str) -> Option<String> {
+    if is_openai_path(path) || upstream_base.trim_end_matches('/') == ANTHROPIC_DIRECT_BASE {
+        return None;
+    }
+
+    for key in [
+        "HEADROOM_ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_AUTH_TOKEN",
+        "DEEPSEEK_TOKEN",
+        "DEEPSEEK_API_KEY",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn is_anthropic_auth_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("x-api-key")
 }
 
 struct ParsedRequestHead {
@@ -1703,13 +1750,13 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
 mod tests {
     use super::{
         bearer_value_changed, codex_snapshot_from_usage_payload, codex_window_label,
-        decode_codex_plan_tier, effective_direct_upstream_base, extract_bearer,
-        extract_header_value, find_header_end, is_hop_by_hop_request_header,
-        is_hop_by_hop_response_header, is_local_proxy_path, is_openai_path,
-        is_reportable_codex_error, parse_codex_rate_limit_headers, parse_request_head,
-        parse_response_status, read_http_headers, request_has_header, request_is_loopback_safe,
-        rewrite_use_responses_lite, run, set_response_content_length, stamp_codex_client_header,
-        strip_request_header, BypassFlag, ModelsRewrite, SharedToken,
+        decode_codex_plan_tier, direct_anthropic_auth_override, effective_direct_upstream_base,
+        extract_bearer, extract_header_value, find_header_end, is_anthropic_auth_header,
+        is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
+        is_openai_path, is_reportable_codex_error, parse_codex_rate_limit_headers,
+        parse_request_head, parse_response_status, read_http_headers, request_has_header,
+        request_is_loopback_safe, rewrite_use_responses_lite, run, set_response_content_length,
+        stamp_codex_client_header, strip_request_header, BypassFlag, ModelsRewrite, SharedToken,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -1723,6 +1770,35 @@ mod tests {
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{timeout, Duration};
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.as_deref() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     #[serial]
@@ -1794,6 +1870,34 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn direct_auth_override_uses_token_for_non_anthropic_upstream() {
+        let _headroom = EnvVarGuard::remove("HEADROOM_ANTHROPIC_AUTH_TOKEN");
+        let _anthropic = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", "sk-deepseek-test");
+
+        assert_eq!(
+            direct_anthropic_auth_override("/v1/messages", "https://api.deepseek.com/anthropic")
+                .as_deref(),
+            Some("sk-deepseek-test")
+        );
+        assert_eq!(
+            direct_anthropic_auth_override("/v1/messages", "https://api.anthropic.com"),
+            None
+        );
+        assert_eq!(
+            direct_anthropic_auth_override("/v1/responses", "https://api.deepseek.com/anthropic"),
+            None
+        );
+    }
+
+    #[test]
+    fn anthropic_auth_header_matches_authorization_and_x_api_key() {
+        assert!(is_anthropic_auth_header("Authorization"));
+        assert!(is_anthropic_auth_header("x-api-key"));
+        assert!(!is_anthropic_auth_header("anthropic-version"));
+    }
+
+    #[test]
     fn extracts_bearer_token_case_insensitively() {
         let request = b"POST / HTTP/1.1\r\nAuthorization: Bearer test-token\r\n\r\n";
         assert_eq!(extract_bearer(request).as_deref(), Some("test-token"));
@@ -1829,6 +1933,29 @@ mod tests {
     fn bearer_value_changed_signals_when_value_differs() {
         let slot: SharedToken = Arc::new(Mutex::new(Some(BearerToken::new("token-A".into()))));
         assert!(bearer_value_changed(&slot, "token-B"));
+    }
+
+    #[test]
+    fn capture_bearer_token_keeps_claude_slot_for_codex_requests() {
+        let token_slot: SharedToken =
+            Arc::new(Mutex::new(Some(BearerToken::new("claude-token".into()))));
+        let codex_plan_slot = Arc::new(Mutex::new(None));
+        let (fresh_bearer_tx, fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+        super::capture_bearer_token(
+            &token_slot,
+            &codex_plan_slot,
+            &fresh_bearer_tx,
+            jwt_with_plan("plus"),
+            true,
+        );
+        assert_eq!(
+            token_slot.lock().as_ref().and_then(|token| token
+                .value_if_fresh(std::time::Duration::from_secs(60))
+                .map(str::to_string)),
+            Some("claude-token".to_string())
+        );
+        assert_eq!(*codex_plan_slot.lock(), Some(CodexPlanTier::Plus));
+        assert!(fresh_bearer_rx.try_recv().is_err());
     }
 
     #[test]
@@ -2036,11 +2163,7 @@ mod tests {
                     let _ = sock.read(&mut buf).await;
                     let _ = sock
                         .write_all(
-                            b"HTTP/1.1 200 OK
-Content-Length: 2
-Connection: close
-
-ok",
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
                         )
                         .await;
                 });
@@ -2055,7 +2178,8 @@ ok",
         drop(intercept_listener);
         let slot_for_run = token_slot.clone();
         let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
-        let anthropic_upstream_base = Arc::new(format!("http://127.0.0.1:{}", upstream_addr.port()));
+        let anthropic_upstream_base =
+            Arc::new(format!("http://127.0.0.1:{}", upstream_addr.port()));
         let openai_upstream_base = Arc::new("https://api.openai.com".to_string());
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
         let run_task = tokio::spawn(async move {
@@ -2084,11 +2208,7 @@ ok",
         }
         let mut client = client.expect("intercept reachable");
         let request = format!(
-            "POST /v1/messages HTTP/1.1
-Host: 127.0.0.1:{}
-Content-Length: 0
-
-",
+            "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 0\r\n\r\n",
             intercept_addr.port()
         );
         client
@@ -2340,6 +2460,10 @@ Content-Length: 0
     async fn bypass_forwards_request_to_upstream_and_streams_response_back() {
         let (upstream_listener, upstream_addr) = bind_ephemeral().await;
         let upstream_base = format!("http://127.0.0.1:{}", upstream_addr.port());
+        let _headroom_auth = EnvVarGuard::remove("HEADROOM_ANTHROPIC_AUTH_TOKEN");
+        let _anthropic_auth = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", "test-direct-token");
+        let _deepseek_token = EnvVarGuard::remove("DEEPSEEK_TOKEN");
+        let _deepseek_api_key = EnvVarGuard::remove("DEEPSEEK_API_KEY");
 
         let upstream_task = tokio::spawn(async move {
             let (mut sock, _) = upstream_listener.accept().await.expect("upstream accept");
@@ -2449,8 +2573,8 @@ Content-Length: 0
         );
         let received_lower = received_str.to_ascii_lowercase();
         assert!(
-            received_lower.contains("authorization: bearer test-bypass-token"),
-            "Authorization forwarded: {received_str:?}"
+            received_lower.contains("authorization: bearer test-direct-token"),
+            "Authorization rewritten for configured upstream: {received_str:?}"
         );
         assert!(
             received_lower.contains("content-type: application/json"),

@@ -53,9 +53,8 @@ use crate::models::{
     ActivityFeedResponse, BillingPeriod, BootstrapProgress, ClaudeAccountProfile,
     ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus, ClientSetupResult,
     ClientSetupVerification, DailySavingsPoint, DashboardState, DeepSeekBalanceResponse,
-    HeadroomAuthCodeRequest, HeadroomLearnPrereqStatus, HeadroomLearnStatus,
-    HeadroomPricingStatus, HeadroomSubscriptionTier, RuntimeStatus, RuntimeUpgradeProgress,
-    TransformationFeedResponse,
+    HeadroomAuthCodeRequest, HeadroomLearnPrereqStatus, HeadroomLearnStatus, HeadroomPricingStatus,
+    HeadroomSubscriptionTier, RuntimeStatus, RuntimeUpgradeProgress, TransformationFeedResponse,
 };
 use crate::state::AppState;
 
@@ -358,7 +357,7 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
         dashboard
     })
     .await
-.map_err(|err| err.to_string())
+    .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -458,6 +457,78 @@ fn normalize_shell_assignment_value(raw: &str) -> Option<String> {
         None
     } else {
         Some(token.to_string())
+    }
+}
+
+fn resolve_shell_assignment(keys: &[&str]) -> Option<String> {
+    let home = dirs::home_dir()?;
+    for profile in [
+        ".zshrc",
+        ".zprofile",
+        ".bashrc",
+        ".bash_profile",
+        ".profile",
+    ] {
+        let Ok(contents) = std::fs::read_to_string(home.join(profile)) else {
+            continue;
+        };
+        for raw_line in contents.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            for key in keys {
+                let export_prefix = format!("export {key}=");
+                if let Some(value) = line.strip_prefix(&export_prefix) {
+                    if let Some(value) = normalize_shell_assignment_value(value) {
+                        return Some(value);
+                    }
+                }
+                let plain_prefix = format!("{key}=");
+                if let Some(value) = line.strip_prefix(&plain_prefix) {
+                    if let Some(value) = normalize_shell_assignment_value(value) {
+                        return Some(value);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn hydrate_anthropic_proxy_env_from_shell_profiles() {
+    if std::env::var("HEADROOM_ANTHROPIC_UPSTREAM")
+        .ok()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        if let Some(upstream) = resolve_shell_assignment(&["HEADROOM_ANTHROPIC_UPSTREAM"]) {
+            std::env::set_var("HEADROOM_ANTHROPIC_UPSTREAM", upstream);
+        }
+    }
+
+    if std::env::var("ANTHROPIC_TARGET_API_URL")
+        .ok()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        if let Ok(upstream) = std::env::var("HEADROOM_ANTHROPIC_UPSTREAM") {
+            if !upstream.trim().is_empty() {
+                std::env::set_var("ANTHROPIC_TARGET_API_URL", upstream);
+            }
+        }
+    }
+
+    if std::env::var("ANTHROPIC_AUTH_TOKEN")
+        .ok()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        if let Some(token) = resolve_shell_assignment(&[
+            "HEADROOM_ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_AUTH_TOKEN",
+            "DEEPSEEK_TOKEN",
+            "DEEPSEEK_API_KEY",
+        ]) {
+            std::env::set_var("ANTHROPIC_AUTH_TOKEN", token);
+        }
     }
 }
 
@@ -3360,6 +3431,7 @@ pub fn run() {
     // Initialize the panic-safe file logger after Sentry so warn!/error!
     // records flow into Sentry too. Failure here cannot abort startup.
     let _ = logging::init();
+    hydrate_anthropic_proxy_env_from_shell_profiles();
 
     // Raise the open-file soft limit to the hard limit. macOS launches GUI apps
     // with RLIMIT_NOFILE soft = 256, which the intercept proxy exhausts under
@@ -3587,12 +3659,12 @@ pub fn run() {
         .on_window_event(|window, event| handle_window_event(window, event))
         .manage(state)
         .manage(PendingAppUpdate(Mutex::new(None)))
-.invoke_handler(tauri::generate_handler![
-get_dashboard_state,
-get_deepseek_balance,
-get_app_update_configuration,
-check_for_app_update,
-install_app_update,
+        .invoke_handler(tauri::generate_handler![
+            get_dashboard_state,
+            get_deepseek_balance,
+            get_app_update_configuration,
+            check_for_app_update,
+            install_app_update,
             restart_app,
             show_app_update_notification,
             show_notification,
